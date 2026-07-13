@@ -263,20 +263,12 @@ class PsqlDbProvider:
         """Never a hard DELETE — sets `_state = 99`. The DB-level
         arc_soft_delete_to_trash trigger (psqldb.ddl) takes it from there:
         snapshots the row into `_trash`, cascades to any child tables via
-        the same mechanism, then physically removes the row.
-
-        Child tables have no updated_by column at all (§ model.py's
-        CHILD_SYSTEM_FIELDS) — found by testing a real child-row delete
-        against a real Postgres, which failed outright with
-        UndefinedColumnError. The SET clause is built conditionally rather
-        than always referencing updated_by, same as update() above already
-        does (there it's guarded by "is the caller passing a value",
-        here it has to be guarded by "does the column even exist")."""
-        schema = self.schema(table)  # raises SchemaError with a clear message if unknown
-        set_clause = "_state = 99" if schema.child else "_state = 99, updated_by = $2"
-        params = (id,) if schema.child else (id, deleted_by)
+        the same mechanism, then physically removes the row."""
+        self.schema(table)  # raises SchemaError with a clear message if unknown
         async with self._conn_or(conn) as c:
-            await c.execute(f'UPDATE "{table}" SET {set_clause} WHERE id = $1', *params)
+            await c.execute(
+                f'UPDATE "{table}" SET _state = 99, updated_by = $2 WHERE id = $1', id, deleted_by
+            )
 
     # ------------------------------------------------------------------ #
     # Batch primitives — one multi-row SQL statement each, not a Python
@@ -401,15 +393,12 @@ class PsqlDbProvider:
     async def soft_delete_many(self, table: str, ids: list[UUID], *, deleted_by: UUID | None = None, conn: Any = None) -> None:
         if not ids:
             return
-        schema = self.schema(table)
+        self.schema(table)
         async with self._conn_or(conn) as c:
-            if schema.child:  # no updated_by column — see soft_delete()'s docstring
-                await c.execute(f'UPDATE "{table}" SET _state = 99 WHERE id = ANY($1::uuid[])', ids)
-            else:
-                await c.execute(
-                    f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE id = ANY($2::uuid[])',
-                    deleted_by, ids,
-                )
+            await c.execute(
+                f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE id = ANY($2::uuid[])',
+                deleted_by, ids,
+            )
 
     async def get_many(self, table: str, ids: list[UUID], *, conn: Any = None) -> list[asyncpg.Record]:
         self.schema(table)
@@ -426,16 +415,11 @@ class PsqlDbProvider:
         TRUNCATE for a very large table (one trigger firing per row) —
         deliberate, matching every other destructive path in this system.
         Returns the number of rows cleared."""
-        schema = self.schema(table)  # raises SchemaError with a clear message if unknown/system table
-        if schema.child:  # no updated_by column — see soft_delete()'s docstring
-            result = await self.execute(
-                f'UPDATE "{table}" SET _state = 99 WHERE _state IS DISTINCT FROM 99'
-            )
-        else:
-            result = await self.execute(
-                f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE _state IS DISTINCT FROM 99',
-                cleared_by,
-            )
+        self.schema(table)  # raises SchemaError with a clear message if unknown/system table
+        result = await self.execute(
+            f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE _state IS DISTINCT FROM 99',
+            cleared_by,
+        )
         return int(result.split()[-1]) if result else 0
 
     async def get(self, table: str, id: UUID, *, conn: Any = None) -> asyncpg.Record | None:

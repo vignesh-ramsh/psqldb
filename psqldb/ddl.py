@@ -236,10 +236,13 @@ BOOTSTRAP_FUNCTIONS_SQL: list[str] = [
         END IF;
 
         -- Read updated_by via to_jsonb() rather than NEW.updated_by directly:
-        -- this same function is attached to every table, and child tables
-        -- have no updated_by column (§ psqldb.model system-field design) —
-        -- a direct field reference would raise "record NEW has no field
-        -- updated_by" there. ->>'...' just yields NULL when the key is absent.
+        -- this same function is attached to every non-system table, and a
+        -- direct field reference would raise "record NEW has no field
+        -- updated_by" on any future table shape that happens to lack the
+        -- column (normal and child tables both have it today, but system
+        -- tables never get this trigger attached at all either way).
+        -- ->>'...' just yields NULL when the key is absent, so this stays
+        -- correct regardless of exactly which shape a given table has.
         INSERT INTO _trash ("table", drop_type, snapshot, deleted_by, deleted_at)
         VALUES (TG_TABLE_NAME, 'Row', to_jsonb(OLD), (to_jsonb(NEW)->>'updated_by')::uuid, now());
 

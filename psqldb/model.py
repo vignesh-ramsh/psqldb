@@ -12,7 +12,10 @@ and apply, without ever importing a business plugin's Python code to do it.
 
 System-field injection (never declared by a business plugin):
   * normal table:  id, created_at, updated_at, created_by, updated_by, _state
-  * child table:   id, parent, idx, created_at, updated_at, _state
+  * child table:   id, parent, idx, created_at, updated_at, created_by,
+                    updated_by, _state — each child row tracks its own
+                    creation/update independently of the parent row; there
+                    is no inheritance from the parent's own audit fields.
   * `"system": true` table: none of the above — the file declares every
     field itself (used for _trash / _field_registry / _audit_* only).
 
@@ -80,6 +83,13 @@ CHILD_SYSTEM_FIELDS = [
     Field(id="_idx", name="idx", type="INT"),
     Field(id="_created_at", name="created_at", type="DATETIME"),
     Field(id="_updated_at", name="updated_at", type="DATETIME"),
+    # created_by/updated_by track who created/last-touched THIS child row
+    # specifically — independent of the parent row's own created_by/updated_by,
+    # exactly the same per-row semantics NORMAL_SYSTEM_FIELDS already has above.
+    # No inheritance from the parent happens anywhere; a child row's audit
+    # fields have only ever meant "this row," parent included.
+    Field(id="_created_by", name="created_by", type="REFERENCE_UUID"),
+    Field(id="_updated_by", name="updated_by", type="REFERENCE_UUID"),
     Field(id="_state", name="_state", type="INT"),
 ]
 
