@@ -16,8 +16,13 @@ System-field injection (never declared by a business plugin):
                     updated_by, _state — each child row tracks its own
                     creation/update independently of the parent row; there
                     is no inheritance from the parent's own audit fields.
-  * `"system": true` table: none of the above — the file declares every
-    field itself (used for _trash / _field_registry / _audit_* only).
+  * `"system": true` table: none of the above injected — the file declares
+    every field itself, exactly like psqldb's own _trash/_field_registry/
+    _patch_history (which are raw SQL, not schema files, but the same
+    "fully self-declared" idea). The ONE additional thing "system": true
+    grants (on top of the exemption above, unchanged) is permission for the
+    table's name to keep a leading `_` (see slugify_table_name below) —
+    reserved otherwise for psqldb's own internal tables.
 
 `_state` exists on every table (child tables included) because the soft-
 delete trigger (psqldb.ddl.SOFT_DELETE_TRIGGER_SQL) cascades a child's
@@ -42,28 +47,55 @@ class SchemaError(ValueError):
     """A schema file itself (not one field in it) is invalid."""
 
 
-def slugify_table_name(filename_stem: str) -> str:
+_RESERVED_SYSTEM_TABLE_NAMES = frozenset({"_trash", "_field_registry", "_patch_history"})
+
+
+def slugify_table_name(filename_stem: str, *, system: bool = False) -> str:
     """"Legal Tasks" -> "legal_tasks". Must produce a valid, boring Postgres
     identifier — collisions and invalid names are rejected loudly at plan/
     migrate time, never silently mangled further than this one deterministic
-    rule. Reserved system tables (_trash, _field_registry, _patch_history,
-    _audit_*) can never collide with a business table name produced here:
-    leading underscores are always stripped before the "starts with a
-    letter" check, so this function can never itself produce one."""
-    slug = _SLUG_RE.sub("_", filename_stem.strip().lower()).strip("_")
-    if not slug or not slug[0].isalpha():
+    rule.
+
+    A leading underscore is preserved ONLY when `system=True` — reserved for
+    a schema explicitly declaring `"system": true`, never a normal or child
+    table (a normal/child filename that happens to start with `_` still has
+    it silently stripped, exactly as before). Patches always pass
+    system=True: a patch never CREATES a table, only resolves a filename to
+    whatever physical table an existing schema already produced, so it must
+    be able to reach an underscore-prefixed name too — this grants no new
+    table-creation capability, since a patch aimed at a name nothing created
+    is just skipped with a warning (see psqldb.migrate).
+
+    `_trash`/`_field_registry`/`_patch_history`/`_audit_*` are psqldb's own
+    internal tables, created via raw SQL directly in psqldb.ddl — they never
+    go through this function at all, so this is a defensive collision guard
+    against a THIRD-PARTY schema claiming one of those exact reserved names,
+    not something that governs psqldb's own bootstrap tables."""
+    raw = _SLUG_RE.sub("_", filename_stem.strip().lower())
+    keep_prefix = system and raw.startswith("_")
+    core = raw.strip("_")
+    if not core or not core[0].isalpha():
         raise SchemaError(
             f"schema filename '{filename_stem}' does not produce a valid "
-            f"table name ('{slug}') — must start with a letter after "
-            f"lowercasing and replacing non [a-z0-9_] characters with '_'."
+            f"table name ('{core}') — must start with a letter (after any "
+            f"reserved leading underscore) after lowercasing and replacing "
+            f"non [a-z0-9_] characters with '_'."
         )
-    if len(slug) > POSTGRES_IDENTIFIER_LIMIT:
+    limit = POSTGRES_IDENTIFIER_LIMIT - (1 if keep_prefix else 0)
+    if len(core) > limit:
         raise SchemaError(
             f"schema filename '{filename_stem}' produces a table name "
-            f"('{slug}') longer than Postgres's {POSTGRES_IDENTIFIER_LIMIT}-"
-            f"character identifier limit — Postgres would silently truncate "
-            f"it, risking a collision with an unrelated table. Shorten the "
+            f"longer than Postgres's {POSTGRES_IDENTIFIER_LIMIT}-character "
+            f"identifier limit — Postgres would silently truncate it, "
+            f"risking a collision with an unrelated table. Shorten the "
             f"filename."
+        )
+    slug = f"_{core}" if keep_prefix else core
+    if slug in _RESERVED_SYSTEM_TABLE_NAMES or slug.startswith("_audit_"):
+        raise SchemaError(
+            f"schema filename '{filename_stem}' produces table name "
+            f"'{slug}', which is reserved for psqldb's own internal "
+            f"bookkeeping tables — choose a different name."
         )
     return slug
 
@@ -99,7 +131,7 @@ class TableSchema:
     table: str                 # slugified physical table name
     plugin: str                # owning plugin name (attributed by the caller, not this file)
     source_path: Path
-    system: bool
+    system: bool               # self-declares every field (no auto-injection); also permits a `_`-prefixed table name
     audit: bool
     child: bool
     fields: list[Field]
@@ -177,10 +209,10 @@ def load_schema_file(path: Path, *, plugin: str) -> TableSchema:
     if not isinstance(raw, dict):
         raise SchemaError(f"{path}: schema file must be a JSON object.")
 
-    table = slugify_table_name(path.stem)
     system = bool(raw.get("system", False))
     audit = bool(raw.get("audit", False))
     child = bool(raw.get("child", False))
+    table = slugify_table_name(path.stem, system=system)
 
     if system and child:
         raise SchemaError(f"{path}: 'system' and 'child' cannot both be true.")
@@ -194,11 +226,9 @@ def load_schema_file(path: Path, *, plugin: str) -> TableSchema:
     # business unique field of its own. The auto-injected `id` doesn't count
     # — it's a surrogate key for framework use (FKs, soft-delete/_trash
     # bookkeeping), never meant to double as a table's real-world identity.
-    # This forces every business table to carry a genuine natural key from
-    # day one, which the Query Engine's reference-by-natural-key resolution
-    # (docs/arc.MD) depends on. System tables declare their own structure
-    # deliberately (_trash, _field_registry, ...) and child tables are
-    # identified by (parent, idx), not a key of their own — both exempt.
+    # System tables self-declare their own structure entirely (including
+    # whatever they use as a key) and child tables are identified by
+    # (parent, idx), not a key of their own — both exempt.
     if not system and not child and not any(f.unique for f in fields):
         raise SchemaError(
             f"{path}: table '{table}' declares no field with \"unique\": true. "
@@ -248,7 +278,8 @@ def load_patch_file(path: Path, *, plugin: str) -> TableSchema:
     if not isinstance(raw, dict):
         raise SchemaError(f"{path}: patch file must be a JSON object.")
 
-    table = slugify_table_name(path.stem)
+    table = slugify_table_name(path.stem, system=True)  # permissive: a patch never creates a
+    # table, only resolves to whatever a schema already created — see slugify_table_name's docstring
     fields, indexes = _parse_fields_and_indexes(raw, path, table=table, known_system_columns=set())
 
     for f in fields:

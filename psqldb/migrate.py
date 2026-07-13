@@ -12,9 +12,11 @@ Two declaration sources, one diff engine:
   * patches/<Table>.json — a plugin adds fields to / modifies fields it
     already owns on a table that already exists (possibly owned by a
     DIFFERENT plugin's schema). Never creates a table (skipped with a
-    warning if the target doesn't exist yet); can drop a field it
-    previously added via an earlier patch if that patch no longer
-    declares it — same Trash-backed path as any other column drop.
+    warning if the target doesn't exist yet, or if the target is a
+    `"system": true` table — those self-declare their entire structure,
+    psqldb.model, so no other plugin's patch ever applies to one); can drop
+    a field it previously added via an earlier patch if that patch no
+    longer declares it — same Trash-backed path as any other column drop.
   * Both are diffed OWNERSHIP-SCOPED: a schema or patch only ever compares
     against the _field_registry rows IT owns on that table (`plugin` column),
     never another plugin's — otherwise plugin A's unrelated re-migrate would
@@ -514,6 +516,7 @@ async def build_plan(
     ))
 
     _resolve_child_owners(schemas)  # validates ownership; raises MigrationError on violation
+    system_tables = {s.table for s in schemas if s.system}
     ref_targets = resolve_ref_targets([*schemas, *patches])
     ref_columns = resolve_ref_columns([*schemas, *patches], ref_targets)  # validates target_field ownership/uniqueness
     ordered, parent_of = _order_and_link(schemas, ref_targets)
@@ -554,6 +557,19 @@ async def build_plan(
 
     for patch in patches:
         if only_table and patch not in targets:
+            continue
+        if patch.table in system_tables:
+            # Patches never apply to system tables — a "system": true table
+            # self-declares its ENTIRE structure itself (psqldb.model);
+            # letting some other plugin patch fields onto it would mean its
+            # shape is no longer fully self-declared. Same "skip, don't
+            # error" treatment as a patch aimed at a table that doesn't
+            # exist yet — the target may simply not have been designed to
+            # accept patches, not a mistake worth halting a migrate over.
+            plan.warnings.append(
+                f"skipped patch '{patch.source_path.name}' (plugin '{patch.plugin}') — "
+                f"table '{patch.table}' is a system table; patches cannot target system tables."
+            )
             continue
         patch_ops, warns, skipped = await _diff_table(
             conn, patch, ref_targets=ref_targets, ref_columns=ref_columns, parent_table=None

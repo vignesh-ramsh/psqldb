@@ -41,7 +41,9 @@ class RefColumn:
 # ------------------------------------------------------------------------ #
 def _system_column_sql(f: Field, *, parent_table: str | None) -> str:
     if f.id == "_id":
-        return '"id" UUID PRIMARY KEY DEFAULT gen_random_uuid()'
+        # arc_uuid_generate_v7(), not Postgres's own gen_random_uuid() (v4) —
+        # see BOOTSTRAP_FUNCTIONS_SQL below for why and how.
+        return '"id" UUID PRIMARY KEY DEFAULT arc_uuid_generate_v7()'
     if f.id == "_parent":
         assert parent_table is not None, "child table system fields require a resolved parent"
         return f'"parent" UUID NOT NULL REFERENCES "{parent_table}"(id) ON DELETE CASCADE'
@@ -92,7 +94,11 @@ def create_table_sql(
 ) -> list[str]:
     """Returns the statements to create `schema` from nothing: the table,
     its indexes, and — for non-system tables — the soft-delete + updated_at
-    triggers."""
+    triggers. A `"system": true` table self-declares its own structure
+    entirely (psqldb.model) and stays outside the automatic soft-delete/
+    audit machinery too, same as psqldb's own _trash/_field_registry/
+    _patch_history (raw SQL, never through this function, but the same
+    "fully self-managed" idea)."""
     ref_columns = ref_columns or {}
     columns: list[str] = []
     for f in schema.system_fields:
@@ -208,6 +214,32 @@ BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
 ]
 
 BOOTSTRAP_FUNCTIONS_SQL: list[str] = [
+    # UUID v7 (time-ordered: 48-bit millisecond timestamp prefix + random
+    # tail), not Postgres's built-in gen_random_uuid() (v4, fully random) —
+    # a v4 PK causes real B-tree fragmentation on every insert (each one
+    # lands on a random leaf page); v7 mostly appends, like a sequential
+    # int PK would, while keeping UUID's distributed-uniqueness property.
+    # Hand-rolled because this targets Postgres 14 — native uuidv7() only
+    # arrived in Postgres 18, and no third-party uuidv7 extension is
+    # installed here either (checked pg_extension directly). Isolated in
+    # its own function, re-applied every migrate like the others below, so
+    # a future move to a native/extension implementation is a one-line
+    # body swap with zero table DDL touched.
+    """
+    CREATE OR REPLACE FUNCTION arc_uuid_generate_v7() RETURNS uuid AS $$
+    DECLARE
+        ts_ms bytea;
+        result bytea;
+    BEGIN
+        ts_ms := substring(int8send(floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint) FROM 3 FOR 6);
+        result := ts_ms || gen_random_bytes(10);
+        result := set_byte(result, 6, (get_byte(result, 6) & 15) | 112);  -- version nibble = 7
+        result := set_byte(result, 8, (get_byte(result, 8) & 63) | 128);  -- variant bits
+        RETURN encode(result, 'hex')::uuid;
+    END;
+    $$ LANGUAGE plpgsql VOLATILE
+    """,
+
     """
     CREATE OR REPLACE FUNCTION arc_set_updated_at() RETURNS trigger AS $$
     BEGIN
