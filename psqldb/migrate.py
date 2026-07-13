@@ -43,6 +43,7 @@ change):
 from __future__ import annotations
 
 import datetime as dt
+import heapq
 from dataclasses import dataclass, field as dc_field
 from pathlib import Path
 from typing import Any, Literal
@@ -211,6 +212,61 @@ def resolve_ref_columns(
     return ref_columns
 
 
+def order_for_clear(
+    tables: set[str], ref_columns: dict[tuple[str, str], "ddl.RefColumn"]
+) -> list[str]:
+    """Orders a set of tables so `arc psqldb clear -p <plugin>` (which
+    clears every table a plugin owns in one pass) respects REFERENCE
+    dependencies among them: a table that references another via a real
+    FK (ON DELETE RESTRICT, §3.9's REFERENCE type) must be cleared FIRST —
+    clear's soft-delete-to-trash trigger issues a real physical DELETE the
+    moment a row's _state hits 99, and that DELETE fails outright with a
+    live ForeignKeyViolationError if some OTHER row (in this same clear
+    batch) still references it. Found by running `arc psqldb clear -p
+    example_hr` for real: 'department' sorted alphabetically before
+    'employee', but employee.department REFERENCES department.code —
+    clearing department's rows first hit exactly that violation.
+
+    Only considers REFERENCE edges where BOTH ends are inside `tables` — a
+    reference to/from a table OUTSIDE this clear's scope isn't this
+    function's problem (that table isn't being touched here at all).
+    TABLE (child) relationships need no such ordering: those FKs are ON
+    DELETE CASCADE, and the trash trigger's own recursive cascade already
+    handles parent-before-child correctly regardless of iteration order.
+
+    Raises MigrationError on a circular REFERENCE dependency within the
+    set — genuinely unclearable together in any single pass; the caller
+    has to break the cycle by hand (clear one side individually first)."""
+    adjacency: dict[str, set[str]] = {t: set() for t in tables}
+    for (owner, _field), ref in ref_columns.items():
+        if owner in tables and ref.table in tables and ref.table != owner:
+            adjacency[owner].add(ref.table)  # owner must be cleared before ref.table
+
+    indegree = {t: 0 for t in tables}
+    for outs in adjacency.values():
+        for out in outs:
+            indegree[out] += 1
+    heap = sorted(t for t, d in indegree.items() if d == 0)
+    heapq.heapify(heap)
+    order: list[str] = []
+    while heap:
+        t = heapq.heappop(heap)
+        order.append(t)
+        for out in sorted(adjacency[t]):
+            indegree[out] -= 1
+            if indegree[out] == 0:
+                heapq.heappush(heap, out)
+
+    if len(order) != len(tables):
+        remaining = sorted(set(tables) - set(order))
+        raise MigrationError(
+            f"cannot determine a safe clear order for {remaining} — a circular "
+            f"REFERENCE dependency exists among them. Clear them individually "
+            f"(`arc psqldb clear -t <table>`), breaking the cycle by hand first."
+        )
+    return order
+
+
 def _order_and_link(
     schemas: list[TableSchema], ref_targets: dict[str, str]
 ) -> tuple[list[TableSchema], dict[str, str]]:
@@ -374,8 +430,25 @@ async def _diff_table(
                 ))
 
     for fid, prev in mine.items():
-        if fid not in current:
-            ops.append(_drop_column_op(schema, prev, source=source))
+        if fid in current:
+            continue
+        # A field is only "missing, therefore dropped" if the file being
+        # diffed right now is the same KIND of file that declared it in the
+        # first place (found by testing this against a real DB: adding a
+        # brand new field to the SCHEMA file, after a PATCH had already
+        # added an unrelated field to the same table, made the schema's own
+        # diff think it needed to DROP the patch's field — the schema was
+        # never responsible for declaring it, so its absence from the
+        # schema's own current fields means nothing). Symmetric with the
+        # patch side directly below: a schema file is the declaration for
+        # schema-sourced fields, a table's ONE patch file is the
+        # declaration for patch-sourced fields — neither is a full listing
+        # of the other's fields, so neither's mere silence about the
+        # other's field is ever a removal signal.
+        expected_source = "patch" if schema.is_patch else "schema"
+        if prev.get("source", "schema") != expected_source:
+            continue
+        ops.append(_drop_column_op(schema, prev, source=source))
 
     ops += [
         Op(kind="ensure_index", table=schema.table, plugin=schema.plugin, source=source,
@@ -559,13 +632,31 @@ def registry_upsert_sql(schemas: list[TableSchema], ref_targets: dict[str, str])
     the NEXT diff compares target_field against (see _diff_table's
     target_field-change guard); it doesn't need cross-schema resolution to
     write, only to validate, and that validation already happened whenever
-    this plan's ref_columns was built."""
+    this plan's ref_columns was built. `source` ('schema' or 'patch')
+    records which kind of file declared each field — see _diff_table's
+    patch drop-detection, which must never treat a SCHEMA-owned field as
+    removed just because one particular patch file doesn't redeclare it.
+
+    The DELETE is scoped by (table, plugin) — NOT by (table, plugin, kind)
+    — and issued only ONCE per (table, plugin) pair even though `schemas`
+    can contain BOTH a schema and one or more patches from the same plugin
+    on the same table (patching your own schema-created table is legal).
+    Issuing a separate DELETE per entry would have the patch's own delete
+    wipe out the schema's just-inserted rows (and vice versa) — same table,
+    same plugin, so the same scope — before either finished writing its
+    own fields, silently corrupting the registry despite every column
+    still being physically present."""
     stmts = []
+    seen_table_plugin: set[tuple[str, str]] = set()
     for schema in schemas:
-        stmts.append(
-            f"DELETE FROM _field_registry WHERE \"table\" = '{schema.table}' "
-            f"AND plugin = '{schema.plugin}'"
-        )
+        key = (schema.table, schema.plugin)
+        if key not in seen_table_plugin:
+            stmts.append(
+                f"DELETE FROM _field_registry WHERE \"table\" = '{schema.table}' "
+                f"AND plugin = '{schema.plugin}'"
+            )
+            seen_table_plugin.add(key)
+        source = "patch" if schema.is_patch else "schema"
         for f in schema.fields:
             length = f.length if f.length is not None else "NULL"
             default = f"'{f.default}'" if f.default is not None else "NULL"
@@ -573,9 +664,9 @@ def registry_upsert_sql(schemas: list[TableSchema], ref_targets: dict[str, str])
             ref_field = f"'{f.target_field}'" if f.type == "REFERENCE" and f.target_field is not None else "NULL"
             stmts.append(
                 "INSERT INTO _field_registry "
-                '(id, name, "table", type, length, reqd, "unique", "default", ref_table, ref_field, plugin) '
+                '(id, name, "table", type, length, reqd, "unique", "default", ref_table, ref_field, source, plugin) '
                 f"VALUES ('{f.id}', '{f.name}', '{schema.table}', '{f.type}', {length}, "
-                f"{f.required}, {f.unique}, {default}, {ref_table}, {ref_field}, '{schema.plugin}')"
+                f"{f.required}, {f.unique}, {default}, {ref_table}, {ref_field}, '{source}', '{schema.plugin}')"
             )
     return stmts
 

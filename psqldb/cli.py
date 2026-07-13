@@ -308,20 +308,28 @@ def clear(
         raise typer.Exit(code=1)
 
     async def _run():
+        from .migrate import order_for_clear
+
         provider = _boot()
         tables = {table} if table else {s.table for s in provider.schemas() if s.plugin == plugin}
         if plugin and not tables:
             err_console.print(f"No schemas registered for plugin '{plugin}'.")
             raise typer.Exit(code=1)
 
-        console.print(f"About to clear all rows from: {', '.join(sorted(tables))}")
+        # Order matters: a table REFERENCING another (ON DELETE RESTRICT)
+        # must be cleared first, or the soft-delete trigger's physical
+        # DELETE on the referenced table hits a live FK violation the
+        # moment some other row in this same clear still points at it.
+        ordered = order_for_clear(tables, provider.ref_columns()) if len(tables) > 1 else sorted(tables)
+
+        console.print(f"About to clear all rows from: {', '.join(ordered)}")
         if not yes and not typer.confirm("Proceed?", default=False):
             console.print("[dim]Aborted — nothing cleared.[/dim]")
             raise typer.Exit(code=1)
 
         await provider.open()
         try:
-            for t in sorted(tables):
+            for t in ordered:
                 count = await provider.clear(t)
                 console.print(f"  {t}: {count} row(s) cleared (recoverable via `arc psqldb trash`)")
         finally:

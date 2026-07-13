@@ -186,6 +186,7 @@ BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
         "default"   TEXT,
         ref_table   TEXT,
         ref_field   TEXT,
+        source      TEXT NOT NULL DEFAULT 'schema' CHECK (source IN ('schema', 'patch')),
         plugin      TEXT NOT NULL,
         created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),

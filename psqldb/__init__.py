@@ -104,13 +104,42 @@ class PsqlDbProvider:
         return list(self._patches)
 
     def schema(self, table: str) -> TableSchema:
+        """The table's CURRENT shape — its own schema's fields plus every
+        patch registered against it, merged (a patch redeclaring an
+        existing field id — a legitimate rename/retype of a field it owns —
+        supersedes the schema's own version; a patch's NEW field ids are
+        appended). This is "what fields actually exist on this table right
+        now", which is what every caller outside the migration system
+        wants — CRUD validation (validate_row/validate_references_exist)
+        and the Query Engine (relay.query) both need to know about a
+        patch-added column exactly the same way they know about a
+        schema-declared one, or a real column becomes invisible to
+        filters/fields/order_by while still being perfectly insertable
+        (found via manual testing against a real Postgres — a patch-added
+        REFERENCE column worked for insert/update, since those build SQL
+        from the payload's own keys, but every Query Engine lookup that
+        validates a field name against schema.column_fields() rejected it
+        as "unknown").
+
+        psqldb.migrate deliberately does NOT go through this — the
+        ownership-scoped diffing in _diff_table needs schema and patches
+        kept SEPARATE (self._schemas / self._patches), and works from
+        those directly."""
         try:
-            return self._by_table[table]
+            base = self._by_table[table]
         except KeyError:
             raise SchemaError(
                 f"no registered schema for table '{table}' "
                 f"(registered: {sorted(self._by_table) or 'none'})."
             ) from None
+        patch_fields = [f for p in self._patches if p.table == table for f in p.fields]
+        if not patch_fields:
+            return base
+        merged: dict[str, Any] = {f.id: f for f in base.fields}
+        for f in patch_fields:
+            merged[f.id] = f
+        from dataclasses import replace
+        return replace(base, fields=list(merged.values()))
 
     def ref_targets(self) -> dict[str, str]:
         return migrate.resolve_ref_targets([*self._schemas, *self._patches])
@@ -234,12 +263,20 @@ class PsqlDbProvider:
         """Never a hard DELETE — sets `_state = 99`. The DB-level
         arc_soft_delete_to_trash trigger (psqldb.ddl) takes it from there:
         snapshots the row into `_trash`, cascades to any child tables via
-        the same mechanism, then physically removes the row."""
-        self.schema(table)  # raises SchemaError with a clear message if unknown
+        the same mechanism, then physically removes the row.
+
+        Child tables have no updated_by column at all (§ model.py's
+        CHILD_SYSTEM_FIELDS) — found by testing a real child-row delete
+        against a real Postgres, which failed outright with
+        UndefinedColumnError. The SET clause is built conditionally rather
+        than always referencing updated_by, same as update() above already
+        does (there it's guarded by "is the caller passing a value",
+        here it has to be guarded by "does the column even exist")."""
+        schema = self.schema(table)  # raises SchemaError with a clear message if unknown
+        set_clause = "_state = 99" if schema.child else "_state = 99, updated_by = $2"
+        params = (id,) if schema.child else (id, deleted_by)
         async with self._conn_or(conn) as c:
-            await c.execute(
-                f'UPDATE "{table}" SET _state = 99, updated_by = $2 WHERE id = $1', id, deleted_by
-            )
+            await c.execute(f'UPDATE "{table}" SET {set_clause} WHERE id = $1', *params)
 
     # ------------------------------------------------------------------ #
     # Batch primitives — one multi-row SQL statement each, not a Python
@@ -364,12 +401,15 @@ class PsqlDbProvider:
     async def soft_delete_many(self, table: str, ids: list[UUID], *, deleted_by: UUID | None = None, conn: Any = None) -> None:
         if not ids:
             return
-        self.schema(table)
+        schema = self.schema(table)
         async with self._conn_or(conn) as c:
-            await c.execute(
-                f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE id = ANY($2::uuid[])',
-                deleted_by, ids,
-            )
+            if schema.child:  # no updated_by column — see soft_delete()'s docstring
+                await c.execute(f'UPDATE "{table}" SET _state = 99 WHERE id = ANY($1::uuid[])', ids)
+            else:
+                await c.execute(
+                    f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE id = ANY($2::uuid[])',
+                    deleted_by, ids,
+                )
 
     async def get_many(self, table: str, ids: list[UUID], *, conn: Any = None) -> list[asyncpg.Record]:
         self.schema(table)
@@ -386,11 +426,16 @@ class PsqlDbProvider:
         TRUNCATE for a very large table (one trigger firing per row) —
         deliberate, matching every other destructive path in this system.
         Returns the number of rows cleared."""
-        self.schema(table)  # raises SchemaError with a clear message if unknown/system table
-        result = await self.execute(
-            f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE _state IS DISTINCT FROM 99',
-            cleared_by,
-        )
+        schema = self.schema(table)  # raises SchemaError with a clear message if unknown/system table
+        if schema.child:  # no updated_by column — see soft_delete()'s docstring
+            result = await self.execute(
+                f'UPDATE "{table}" SET _state = 99 WHERE _state IS DISTINCT FROM 99'
+            )
+        else:
+            result = await self.execute(
+                f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE _state IS DISTINCT FROM 99',
+                cleared_by,
+            )
         return int(result.split()[-1]) if result else 0
 
     async def get(self, table: str, id: UUID, *, conn: Any = None) -> asyncpg.Record | None:
