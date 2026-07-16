@@ -110,7 +110,7 @@ class PsqlDbProvider:
         supersedes the schema's own version; a patch's NEW field ids are
         appended). This is "what fields actually exist on this table right
         now", which is what every caller outside the migration system
-        wants — CRUD validation (validate_row/validate_references_exist)
+        wants — CRUD validation (validate_row/validate_columns_known)
         and the Query Engine (relay.query) both need to know about a
         patch-added column exactly the same way they know about a
         schema-declared one, or a real column becomes invisible to
@@ -232,9 +232,9 @@ class PsqlDbProvider:
         schema = self.schema(table)
         clean = {k: v for k, v in data.items() if k not in _SYSTEM_COLUMN_NAMES}
         validation.validate_row(schema, clean)
+        validation.validate_columns_known(schema, clean)
 
         async with self._conn_or(conn) as c:
-            await validation.validate_references_exist(c, schema, clean, self.ref_targets())
             columns = list(clean.keys())
             if created_by is not None:
                 columns.append("created_by")
@@ -242,33 +242,56 @@ class PsqlDbProvider:
             placeholders = ", ".join(f"${i + 1}" for i in range(len(columns)))
             col_list = ", ".join(f'"{c}"' for c in columns)
             query = f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders}) RETURNING *'
-            return await c.fetchrow(query, *(clean[col] for col in columns))
+            try:
+                return await c.fetchrow(query, *(clean[col] for col in columns))
+            except asyncpg.ForeignKeyViolationError as exc:
+                raise validation.friendly_fk_error(exc, table=table) from exc
+            except asyncpg.UniqueViolationError as exc:
+                raise validation.friendly_unique_error(exc, table=table) from exc
 
     async def update(self, table: str, id: UUID, data: dict[str, Any], *, updated_by: UUID | None = None, conn: Any = None) -> asyncpg.Record | None:
         schema = self.schema(table)
         clean = {k: v for k, v in data.items() if k not in _SYSTEM_COLUMN_NAMES}
         validation.validate_row(schema, clean)
+        validation.validate_columns_known(schema, clean)
 
         async with self._conn_or(conn) as c:
-            await validation.validate_references_exist(c, schema, clean, self.ref_targets())
             columns = list(clean.keys())
             if updated_by is not None:
                 columns.append("updated_by")
                 clean = {**clean, "updated_by": updated_by}
             set_clause = ", ".join(f'"{col}" = ${i + 2}' for i, col in enumerate(columns))
             query = f'UPDATE "{table}" SET {set_clause} WHERE id = $1 RETURNING *'
-            return await c.fetchrow(query, id, *(clean[col] for col in columns))
+            try:
+                return await c.fetchrow(query, id, *(clean[col] for col in columns))
+            except asyncpg.ForeignKeyViolationError as exc:
+                raise validation.friendly_fk_error(exc, table=table) from exc
+            except asyncpg.UniqueViolationError as exc:
+                raise validation.friendly_unique_error(exc, table=table) from exc
 
     async def soft_delete(self, table: str, id: UUID, *, deleted_by: UUID | None = None, conn: Any = None) -> None:
-        """Never a hard DELETE — sets `_state = 99`. The DB-level
-        arc_soft_delete_to_trash trigger (psqldb.ddl) takes it from there:
-        snapshots the row into `_trash`, cascades to any child tables via
-        the same mechanism, then physically removes the row."""
-        self.schema(table)  # raises SchemaError with a clear message if unknown
+        """Never a hard DELETE for a normal/child table — sets `_state = 99`.
+        The DB-level arc_soft_delete_to_trash trigger (psqldb.ddl) takes it
+        from there: snapshots the row into `_trash`, cascades to any child
+        tables via the same mechanism, then physically removes the row.
+
+        A `"system": true` table (psqldb.model) has none of that machinery —
+        no `_state` column, no trigger attached (§3.9) — so soft-delete
+        genuinely isn't applicable to it, only a real hard DELETE is. Not an
+        error case: a system table simply IS the "always hard delete" table
+        kind, same as `_trash`/`_field_registry`/`_patch_history` themselves
+        would be if anything ever deleted from those. `_users`/`_access_keys`
+        still get an audit-trail row for the delete via their own
+        `arc_audit_{plugin}` trigger (fires on DELETE too), same as any other
+        audited table — only `_trash` recovery doesn't apply."""
+        schema = self.schema(table)  # raises SchemaError with a clear message if unknown
         async with self._conn_or(conn) as c:
-            await c.execute(
-                f'UPDATE "{table}" SET _state = 99, updated_by = $2 WHERE id = $1', id, deleted_by
-            )
+            if schema.system:
+                await c.execute(f'DELETE FROM "{table}" WHERE id = $1', id)
+            else:
+                await c.execute(
+                    f'UPDATE "{table}" SET _state = 99, updated_by = $2 WHERE id = $1', id, deleted_by
+                )
 
     # ------------------------------------------------------------------ #
     # Batch primitives — one multi-row SQL statement each, not a Python
@@ -305,6 +328,7 @@ class PsqlDbProvider:
         for data in rows:
             clean = {k: v for k, v in data.items() if k not in _SYSTEM_COLUMN_NAMES}
             validation.validate_row(schema, clean)
+            validation.validate_columns_known(schema, clean)
             cleaned.append(clean)
         columns = self._require_homogeneous("insert_many", [set(c) for c in cleaned])
         if created_by is not None:
@@ -312,9 +336,6 @@ class PsqlDbProvider:
             cleaned = [{**c, "created_by": created_by} for c in cleaned]
 
         async with self._conn_or(conn) as c:
-            ref_targets = self.ref_targets()
-            for clean in cleaned:
-                await validation.validate_references_exist(c, schema, clean, ref_targets)
             col_list = ", ".join(f'"{col}"' for col in columns)
             value_rows, params, pi = [], [], 1
             for clean in cleaned:
@@ -322,7 +343,12 @@ class PsqlDbProvider:
                 params.extend(clean[col] for col in columns)
                 pi += len(columns)
             query = f'INSERT INTO "{table}" ({col_list}) VALUES {", ".join(value_rows)} RETURNING *'
-            return await c.fetch(query, *params)
+            try:
+                return await c.fetch(query, *params)
+            except asyncpg.ForeignKeyViolationError as exc:
+                raise validation.friendly_fk_error(exc, table=table) from exc
+            except asyncpg.UniqueViolationError as exc:
+                raise validation.friendly_unique_error(exc, table=table) from exc
 
     async def update_many(self, table: str, updates: list[dict[str, Any]], *, updated_by: UUID | None = None, conn: Any = None) -> list[asyncpg.Record]:
         """`updates` is `[{"id": ..., "data": {...}}, ...]` — every entry's
@@ -337,6 +363,7 @@ class PsqlDbProvider:
                 raise ValueError(f"update_many: entry {i} must have 'id' and 'data' keys.")
             clean = {k: v for k, v in u["data"].items() if k not in _SYSTEM_COLUMN_NAMES}
             validation.validate_row(schema, clean)
+            validation.validate_columns_known(schema, clean)
             ids.append(u["id"])
             cleaned.append(clean)
         columns = self._require_homogeneous("update_many", [set(c) for c in cleaned])
@@ -345,10 +372,6 @@ class PsqlDbProvider:
             cleaned = [{**c, "updated_by": updated_by} for c in cleaned]
 
         async with self._conn_or(conn) as c:
-            ref_targets = self.ref_targets()
-            for clean in cleaned:
-                await validation.validate_references_exist(c, schema, clean, ref_targets)
-
             # Every value in an anonymous VALUES(...) list needs an explicit
             # cast — Postgres plans a prepared statement before it ever sees
             # the actual parameter values, so it can't infer "this matches
@@ -388,17 +411,25 @@ class PsqlDbProvider:
                 f'FROM (VALUES {", ".join(value_rows)}) AS data({data_col_list}) '
                 f'WHERE "{table}".id = data._row_id RETURNING "{table}".*'
             )
-            return await c.fetch(query, *params)
+            try:
+                return await c.fetch(query, *params)
+            except asyncpg.ForeignKeyViolationError as exc:
+                raise validation.friendly_fk_error(exc, table=table) from exc
+            except asyncpg.UniqueViolationError as exc:
+                raise validation.friendly_unique_error(exc, table=table) from exc
 
     async def soft_delete_many(self, table: str, ids: list[UUID], *, deleted_by: UUID | None = None, conn: Any = None) -> None:
         if not ids:
             return
-        self.schema(table)
+        schema = self.schema(table)
         async with self._conn_or(conn) as c:
-            await c.execute(
-                f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE id = ANY($2::uuid[])',
-                deleted_by, ids,
-            )
+            if schema.system:
+                await c.execute(f'DELETE FROM "{table}" WHERE id = ANY($1::uuid[])', ids)
+            else:
+                await c.execute(
+                    f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE id = ANY($2::uuid[])',
+                    deleted_by, ids,
+                )
 
     async def get_many(self, table: str, ids: list[UUID], *, conn: Any = None) -> list[asyncpg.Record]:
         self.schema(table)
@@ -414,13 +445,105 @@ class PsqlDbProvider:
         automatically (same mechanism, no special-casing here). Slower than
         TRUNCATE for a very large table (one trigger firing per row) —
         deliberate, matching every other destructive path in this system.
-        Returns the number of rows cleared."""
-        self.schema(table)  # raises SchemaError with a clear message if unknown/system table
-        result = await self.execute(
-            f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE _state IS DISTINCT FROM 99',
-            cleared_by,
-        )
+        A `"system": true` table has no _state/trigger machinery (see
+        soft_delete's docstring) — cleared via a real DELETE instead, same
+        "always hard delete" exception. Returns the number of rows cleared."""
+        schema = self.schema(table)  # raises SchemaError with a clear message if unknown
+        if schema.system:
+            result = await self.execute(f'DELETE FROM "{table}"')
+        else:
+            result = await self.execute(
+                f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE _state IS DISTINCT FROM 99',
+                cleared_by,
+            )
         return int(result.split()[-1]) if result else 0
+
+    # ------------------------------------------------------------------ #
+    # `arc plugin disable <name> --wipe` — DDL-level, irreversible (unlike
+    # clear() above, there's no _trash for a dropped TABLE, only for a
+    # dropped ROW). Two real dependency questions, checked two different
+    # ways because only one of them is something Postgres itself knows
+    # about:
+    #   1. Did another plugin PATCH extra fields onto a table this plugin
+    #      owns? Postgres has no concept of "which ARC plugin owns this
+    #      column" — dropping the table trivially takes those columns with
+    #      it and Postgres raises nothing. Checked ourselves, against
+    #      _field_registry, before touching anything.
+    #   2. Does some OTHER plugin's table have a live REFERENCE (a real
+    #      FK) pointing at one of these? Postgres already enforces this —
+    #      a plain DROP TABLE (no CASCADE) fails outright with
+    #      DependentObjectsStillExistError if so. Caught, not
+    #      pre-checked ourselves — same "let the real constraint be the
+    #      safety net" posture as the FK-existence pre-check that used to
+    #      exist on the write path and was removed for being redundant
+    #      (§3.9's write-path hardening notes).
+    # Both are refused by default; `force=True` overrides both — dropping
+    # the table anyway (patch case) or retrying with CASCADE (FK case).
+    # ------------------------------------------------------------------ #
+    async def wipe_plugin_tables(self, plugin: str, *, force: bool = False, dry_run: bool = False) -> dict:
+        """Returns {"tables": [...ordered...], "audit_table": str | None,
+        "row_counts": {table: int}}. `row_counts` is always computed (even
+        on a real, non-dry-run call) so the caller can show what was about
+        to be destroyed either way. `dry_run=True` stops after computing
+        the plan — no DDL executed at all, safe to call purely to preview.
+        Raises MigrationError (never touches anything) if another plugin
+        owns fields on one of these tables and force=False."""
+        tables = {s.table for s in self.schemas() if s.plugin == plugin}
+        if not tables:
+            return {"tables": [], "audit_table": None, "row_counts": {}}
+
+        if not force:
+            foreign = await self.fetch(
+                'SELECT DISTINCT "table", plugin FROM _field_registry '
+                'WHERE "table" = ANY($1) AND plugin != $2',
+                list(tables), plugin,
+            )
+            if foreign:
+                detail = ", ".join(f"'{r['table']}' (has fields owned by '{r['plugin']}')" for r in foreign)
+                raise migrate.MigrationError(
+                    f"cannot wipe '{plugin}': {detail} — another plugin has patched fields onto "
+                    f"a table '{plugin}' owns; dropping it would destroy that plugin's columns "
+                    f"and data too. Pass force=True to do it anyway."
+                )
+
+        ordered = migrate.order_for_clear(tables, self.ref_columns()) if len(tables) > 1 else sorted(tables)
+
+        audit_table = f"_audit_{plugin}"
+        exists = await self.fetch_val(
+            "SELECT 1 FROM information_schema.tables WHERE table_name = $1", audit_table
+        )
+        audit_table = audit_table if exists else None
+        all_tables = [*ordered, *([audit_table] if audit_table else [])]
+
+        row_counts = {t: await self.fetch_val(f'SELECT COUNT(*) FROM "{t}"') for t in all_tables}
+
+        if dry_run:
+            return {"tables": ordered, "audit_table": audit_table, "row_counts": row_counts}
+
+        for table in all_tables:
+            await self._drop_table_for_wipe(table, force=force)
+        if audit_table:
+            # The trigger itself disappears along with its table (a
+            # trigger is a property of the table it's attached to) — only
+            # the shared trigger FUNCTION is a separate object that
+            # outlives it and needs its own cleanup.
+            await self.execute(f'DROP FUNCTION IF EXISTS "arc_audit_{plugin}"() CASCADE')
+
+        await self.execute('DELETE FROM _field_registry WHERE "table" = ANY($1)', all_tables)
+        await self.execute('DELETE FROM _patch_history WHERE "table" = ANY($1)', all_tables)
+
+        return {"tables": ordered, "audit_table": audit_table, "row_counts": row_counts}
+
+    async def _drop_table_for_wipe(self, table: str, *, force: bool) -> None:
+        try:
+            await self.execute(f'DROP TABLE "{table}"')
+        except asyncpg.exceptions.DependentObjectsStillExistError as exc:
+            if not force:
+                raise migrate.MigrationError(
+                    f"cannot drop '{table}': something outside this plugin still references it "
+                    f"({exc}). Pass force=True to CASCADE — this destroys the dependent object too."
+                ) from exc
+            await self.execute(f'DROP TABLE "{table}" CASCADE')
 
     async def get(self, table: str, id: UUID, *, conn: Any = None) -> asyncpg.Record | None:
         self.schema(table)
