@@ -269,11 +269,69 @@ def order_for_clear(
     return order
 
 
+def order_for_create(
+    tables: list[str], ref_columns: dict[tuple[str, str], "ddl.RefColumn"]
+) -> list[str]:
+    """Orders a set of tables so a fresh `arc psqldb migrate` creates a
+    REFERENCE's target table before the table that points to it — the
+    opposite requirement from order_for_clear (§ above), same underlying
+    dependency graph. ddl._user_column_sql renders REFERENCES inline in the
+    CREATE TABLE statement itself, so creating the referencing table first
+    fails outright with an UndefinedTableError the moment its target
+    doesn't exist yet.
+
+    Found the same way order_for_clear's bug was found: `_order_and_link`
+    previously only ordered TABLE (child) schemas after their parents —
+    plain REFERENCE dependencies among non-child tables were never
+    considered at all, and schema files are loaded in sorted filename
+    order (psqldb.model.load_schemas_dir), which has no reason to match
+    dependency order. A schema named "_access_keys.json" referencing
+    "_users.json" sorts before it alphabetically — exactly the failure
+    case this closes.
+
+    Only considers REFERENCE edges where BOTH ends are inside `tables` —
+    matches order_for_clear's own scoping rule (a table already created in
+    an earlier migrate run isn't this ordering's problem). Raises
+    MigrationError on a circular REFERENCE dependency, same as
+    order_for_clear."""
+    table_set = set(tables)
+    adjacency: dict[str, set[str]] = {t: set() for t in tables}
+    for (owner, _field), ref in ref_columns.items():
+        if owner in table_set and ref.table in table_set and ref.table != owner:
+            adjacency[ref.table].add(owner)  # ref.table must be created before owner
+
+    indegree = {t: 0 for t in tables}
+    for outs in adjacency.values():
+        for out in outs:
+            indegree[out] += 1
+    heap = sorted(t for t, d in indegree.items() if d == 0)
+    heapq.heapify(heap)
+    order: list[str] = []
+    while heap:
+        t = heapq.heappop(heap)
+        order.append(t)
+        for out in sorted(adjacency[t]):
+            indegree[out] -= 1
+            if indegree[out] == 0:
+                heapq.heappush(heap, out)
+
+    if len(order) != len(tables):
+        remaining = sorted(set(tables) - set(order))
+        raise MigrationError(
+            f"cannot determine a safe create order for {remaining} — a circular "
+            f"REFERENCE dependency exists among them."
+        )
+    return order
+
+
 def _order_and_link(
-    schemas: list[TableSchema], ref_targets: dict[str, str]
+    schemas: list[TableSchema], ref_targets: dict[str, str],
+    ref_columns: dict[tuple[str, str], "ddl.RefColumn"] | None = None,
 ) -> tuple[list[TableSchema], dict[str, str]]:
-    """Returns (ordered schemas — parents before children, parent_of map
-    "child table" -> "parent table")."""
+    """Returns (ordered schemas — parents before children, each bucket
+    itself ordered by REFERENCE dependency via order_for_create so a fresh
+    CREATE TABLE never references a target that doesn't exist yet; parent_of
+    map "child table" -> "parent table")."""
     by_stem = {s.source_path.stem: s for s in schemas}
     parent_of: dict[str, str] = {}
     for s in schemas:
@@ -283,6 +341,12 @@ def _order_and_link(
 
     parents = [s for s in schemas if not s.child]
     children = [s for s in schemas if s.child]
+
+    if ref_columns:
+        by_table = {s.table: s for s in schemas}
+        parents = [by_table[t] for t in order_for_create([s.table for s in parents], ref_columns)]
+        children = [by_table[t] for t in order_for_create([s.table for s in children], ref_columns)]
+
     return [*parents, *children], parent_of
 
 
@@ -519,7 +583,7 @@ async def build_plan(
     system_tables = {s.table for s in schemas if s.system}
     ref_targets = resolve_ref_targets([*schemas, *patches])
     ref_columns = resolve_ref_columns([*schemas, *patches], ref_targets)  # validates target_field ownership/uniqueness
-    ordered, parent_of = _order_and_link(schemas, ref_targets)
+    ordered, parent_of = _order_and_link(schemas, ref_targets, ref_columns)
 
     targets = [*ordered, *patches]
     if only_table:
@@ -538,7 +602,16 @@ async def build_plan(
                 description=f'ensure audit table "_audit_{schema.plugin}" exists',
                 sql=ddl.audit_table_sql(schema.plugin), destructive=False,
             ))
-        seen_plugins.add(schema.plugin)
+            # Only mark a plugin "seen" once its audit table has actually
+            # been ensured — adding it unconditionally here (for EVERY
+            # schema, audited or not) meant a plugin whose first-processed
+            # schema has "audit": false poisoned this set before a LATER
+            # audited schema from the same plugin was ever reached, and the
+            # _audit_<plugin> table/function silently never got created.
+            # Never triggered before authn: every previously-audited plugin
+            # (example_hr) happened to have its audited schema ordered
+            # first, which masked this exact ordering dependency.
+            seen_plugins.add(schema.plugin)
 
         table_ops, warns, skipped = await _diff_table(
             conn, schema, ref_targets=ref_targets, ref_columns=ref_columns, parent_table=parent_of.get(schema.table)

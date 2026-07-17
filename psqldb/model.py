@@ -238,6 +238,25 @@ def load_schema_file(path: Path, *, plugin: str) -> TableSchema:
             f"an employee_code, an order number, a slug) as \"unique\": true."
         )
 
+    # A "system": true table gets no auto-injected id (system_fields is empty
+    # above) — it must self-declare exactly one primary_key field, which psqldb.ddl
+    # then renders with the same arc_uuid_generate_v7() default a normal table's
+    # auto-injected id gets. Any other table already has its id auto-injected, so
+    # a second, hand-declared one would just be a dead/conflicting column.
+    pk_fields = [f for f in fields if f.primary_key]
+    if system and len(pk_fields) != 1:
+        raise SchemaError(
+            f"{path}: system table '{table}' must declare exactly one field with "
+            f"\"primary_key\": true (found {len(pk_fields)}) — a system table "
+            f"self-declares its own key since no id is auto-injected for it."
+        )
+    if not system and pk_fields:
+        raise SchemaError(
+            f"{path}: table '{table}' declares \"primary_key\": true on field "
+            f"'{pk_fields[0].name}', but only a \"system\": true table may do that "
+            f"— this table already gets its 'id' auto-injected."
+        )
+
     return TableSchema(
         table=table, plugin=plugin, source_path=path, system=system, audit=audit,
         child=child, fields=fields, indexes=indexes, system_fields=system_fields,

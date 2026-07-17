@@ -50,34 +50,60 @@ def validate_row(schema: TableSchema, data: dict[str, Any]) -> None:
         raise ValidationError(f"validation failed for '{schema.table}': " + "; ".join(problems))
 
 
-async def validate_references_exist(conn: Any, schema: TableSchema, data: dict[str, Any], ref_targets: dict[str, str]) -> None:
-    """REFERENCE fields already have a DB-level FK, so this is defense in
-    depth (a clearer error before the FK violation, not instead of it).
-
-    Checks against `f.target_field or "id"` directly — no cross-schema
-    resolution (psqldb.migrate.resolve_ref_columns) needed here, unlike DDL
-    rendering: by the time a row is being inserted/updated, target_field has
-    already been validated (at plan/migrate time) as a real, unique column
-    on the target, so this only needs the field itself to know which column
-    to check."""
-    problems: list[str] = []
-    for f in schema.fields:
-        if f.type != "REFERENCE":
-            continue
-        value = data.get(f.name)
-        if value is None:
-            continue
-        target_table = ref_targets.get(f.target)
-        if not target_table:
-            continue
-        target_column = f.target_field or "id"
-        exists = await conn.fetchval(
-            f'select exists(select 1 from "{target_table}" where "{target_column}" = $1)', value
+def validate_columns_known(schema: TableSchema, data: dict[str, Any]) -> None:
+    """Every key in `data` must be a real column on `schema`. insert()/
+    update() (psqldb/__init__.py) build SQL identifiers directly from these
+    keys (`f'"{col}"'`) — an unknown key isn't just a typo worth a clear
+    error, it's an unvalidated string about to be interpolated into a SQL
+    identifier position. The Query Engine (relay/query.py) already
+    whitelists every column this way for reads (parse_filters); this closes
+    the matching gap on the write side."""
+    known = {f.name for f in schema.column_fields()}
+    unknown = [k for k in data if k not in known]
+    if unknown:
+        raise ValidationError(
+            f"'{schema.table}': unknown field(s) {sorted(unknown)} — not a declared "
+            f"column (known: {sorted(known)})."
         )
-        if not exists:
-            problems.append(
-                f"'{f.name}': referenced value '{value}' does not exist in "
-                f"'{target_table}'.\"{target_column}\"."
-            )
-    if problems:
-        raise ValidationError(f"validation failed for '{schema.table}': " + "; ".join(problems))
+
+
+def friendly_fk_error(exc: Exception, *, table: str) -> ValidationError:
+    """Translates asyncpg's ForeignKeyViolationError into the same
+    ValidationError shape validate_row already raises. Replaces a separate
+    pre-check SELECT per REFERENCE field that used to run before every
+    insert/update (psqldb/__init__.py) — the DB already enforces this via
+    the real FK constraint (ON DELETE RESTRICT, psqldb.ddl), so the
+    pre-check was a redundant round-trip; catching the real violation
+    instead costs nothing on the success path, which is the common case.
+
+    Constraint names for a REFERENCE column follow one deterministic
+    pattern (psqldb.ddl._user_column_sql's inline `REFERENCES` clause,
+    never a named CONSTRAINT — Postgres auto-names it "{table}_{column}
+    _fkey"), so this can usually name the offending field; falls back to
+    Postgres's own `detail` message (always present) if the pattern
+    doesn't match for some reason, rather than guessing."""
+    constraint = getattr(exc, "constraint_name", "") or ""
+    prefix, suffix = f"{table}_", "_fkey"
+    field = constraint[len(prefix):-len(suffix)] if constraint.startswith(prefix) and constraint.endswith(suffix) else None
+    detail = getattr(exc, "detail", None) or str(exc)
+    if field:
+        return ValidationError(f"'{table}': '{field}' references a row that doesn't exist ({detail})")
+    return ValidationError(f"'{table}': {detail}")
+
+
+def friendly_unique_error(exc: Exception, *, table: str) -> ValidationError:
+    """Translates asyncpg's UniqueViolationError the same way
+    friendly_fk_error (above) translates a FK violation — a `"unique": true`
+    field's constraint follows Postgres's own default naming for a plain
+    column UNIQUE constraint, "{table}_{column}_key" (confirmed against a
+    real migrated table, e.g. "_users_email_key"), so this can usually name
+    the offending field directly instead of surfacing a raw
+    UniqueViolationError traceback for what's almost always an ordinary
+    operator mistake (a duplicate email, a duplicate role name)."""
+    constraint = getattr(exc, "constraint_name", "") or ""
+    prefix, suffix = f"{table}_", "_key"
+    field = constraint[len(prefix):-len(suffix)] if constraint.startswith(prefix) and constraint.endswith(suffix) else None
+    detail = getattr(exc, "detail", None) or str(exc)
+    if field:
+        return ValidationError(f"'{table}': '{field}' must be unique ({detail})")
+    return ValidationError(f"'{table}': {detail}")

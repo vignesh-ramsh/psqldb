@@ -43,6 +43,7 @@ _SQL_TEMPLATES: dict[str, str] = {
     "PHONE": "VARCHAR({length})",
     "SELECT": "VARCHAR({length})",
     "REFERENCE": "UUID",
+    "UUID": "UUID",
 }
 
 RELATIONAL_TYPES = frozenset({"REFERENCE", "TABLE"})
@@ -85,6 +86,10 @@ class Field:
     type: str
     required: bool = False
     unique: bool = False
+    primary_key: bool = False  # UUID only (enforced in parse_field below); only valid
+                                # on a "system": true schema (enforced in psqldb.model,
+                                # which is where "exactly one per schema" is checked too
+                                # — needs every field at once, not just this one).
     length: int | None = None
     precision: int | None = None
     scale: int | None = None
@@ -149,6 +154,7 @@ def parse_field(raw: dict, *, table: str, index: int) -> Field:
 
     required = bool(raw.get("required", raw.get("req", False)))
     unique = bool(raw.get("unique", False))
+    primary_key = bool(raw.get("primary_key", False))
     length = raw.get("length")
     precision = raw.get("precision")
     scale = raw.get("scale")
@@ -157,6 +163,8 @@ def parse_field(raw: dict, *, table: str, index: int) -> Field:
     target = raw.get("target")
     target_field = raw.get("target_field")
 
+    if primary_key and ftype != "UUID":
+        raise FieldError(f"{where}: 'primary_key' is only valid for type UUID (got {ftype}).")
     if ftype == "DECIMAL" and precision is None:
         raise FieldError(f"{where}: type DECIMAL requires 'precision'.")
     if ftype == "SELECT":
@@ -183,6 +191,6 @@ def parse_field(raw: dict, *, table: str, index: int) -> Field:
 
     return Field(
         id=field_id, name=name, type=ftype, required=required, unique=unique,
-        length=length, precision=precision, scale=scale, default=default,
-        options=options, target=target, target_field=target_field,
+        primary_key=primary_key, length=length, precision=precision, scale=scale,
+        default=default, options=options, target=target, target_field=target_field,
     )

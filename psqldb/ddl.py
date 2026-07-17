@@ -59,6 +59,15 @@ def _system_column_sql(f: Field, *, parent_table: str | None) -> str:
 
 
 def _user_column_sql(f: Field, *, owner_table: str, ref_columns: dict[tuple[str, str], RefColumn]) -> str:
+    if f.primary_key:
+        # Same shape a normal table's auto-injected id gets (_system_column_sql's
+        # "_id" branch above) — just self-declared, since a "system": true table
+        # has no auto-injected system_fields at all (psqldb.model). A PRIMARY KEY
+        # is already NOT NULL UNIQUE, and arc_uuid_generate_v7() is a function
+        # call, not a literal, so this deliberately skips the generic
+        # required/default/unique rendering below (_sql_literal would wrongly
+        # quote a function call as a string).
+        return f'"{f.name}" UUID PRIMARY KEY DEFAULT arc_uuid_generate_v7()'
     ref = ref_columns.get((owner_table, f.name)) if f.type == "REFERENCE" else None
     # `ref` is resolved (and, for a non-default target_field, validated as
     # pointing at a real "unique": true column) by psqldb.migrate before this
@@ -315,16 +324,27 @@ def audit_table_sql(plugin: str) -> list[str]:
         """,
         f"""
         CREATE OR REPLACE FUNCTION arc_audit_{plugin}() RETURNS trigger AS $$
+        DECLARE
+            new_json jsonb := to_jsonb(NEW);
+            old_json jsonb := to_jsonb(OLD);
         BEGIN
+            -- changed_by goes through the jsonb representation, not a direct
+            -- NEW.updated_by/OLD.updated_by struct reference: this function is
+            -- shared across every audited table for the plugin, and a
+            -- "system": true table (psqldb.model) self-declares its own
+            -- columns — it has no auto-injected updated_by at all. ->>'key' on
+            -- jsonb degrades to NULL when the key's absent instead of raising
+            -- "record has no field", so this works for both table shapes
+            -- without the function needing to know which one it's on.
             INSERT INTO "{table}" ("table", row_id, changes, changed_by)
             VALUES (
                 TG_TABLE_NAME,
                 COALESCE(NEW.id, OLD.id),
                 jsonb_build_object(
-                    'before', CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE to_jsonb(OLD) END,
-                    'after',  CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE to_jsonb(NEW) END
+                    'before', CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE old_json END,
+                    'after',  CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE new_json END
                 ),
-                COALESCE(NEW.updated_by, OLD.updated_by)
+                COALESCE((new_json->>'updated_by')::uuid, (old_json->>'updated_by')::uuid)
             );
             RETURN COALESCE(NEW, OLD);
         END;
