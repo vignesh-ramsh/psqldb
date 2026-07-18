@@ -161,22 +161,35 @@ def _root_or_exit() -> Path:
 
 async def _build_plan(plugin: str | None, table: str | None) -> tuple[object, migrate.MigrationPlan]:
     provider = _boot()
-    schemas, patches = provider.schemas(), provider.patches()
-    if plugin:
-        schemas = [s for s in schemas if s.plugin == plugin]
-        patches = [p for p in patches if p.plugin == plugin]
-        if not schemas and not patches:
-            err_console.print(f"No schemas or patches registered for plugin '{plugin}'.")
-            raise typer.Exit(code=1)
+    if plugin and not any(
+        s.plugin == plugin for s in [*provider.schemas(), *provider.patches()]
+    ):
+        err_console.print(f"No schemas or patches registered for plugin '{plugin}'.")
+        raise typer.Exit(code=1)
     await provider.open()
     try:
         async with provider.acquire() as conn:
+            # Always diff the FULL schema set (a -p scope must not make other
+            # plugins' tables look "no longer declared" to _dropped_table_ops),
+            # then narrow both ops AND schemas to the scope — see _scope_plan.
             plan = await migrate.build_plan(conn, provider.schemas(), provider.patches(), only_table=table)
             if plugin:
-                plan.ops = [op for op in plan.ops if op.plugin == plugin or op.table == "_bootstrap"]
+                _scope_plan(plan, plugin)
     finally:
         await provider.close()
     return provider, plan
+
+
+def _scope_plan(plan: migrate.MigrationPlan, plugin: str) -> None:
+    """Narrow a full plan to one plugin — BOTH the ops that will execute and
+    the schemas whose _field_registry rows apply_plan will overwrite. The
+    ops filter alone used to leave plan.schemas covering every plugin, so a
+    scoped migrate recorded OTHER plugins' still-pending declarations in
+    _field_registry as if their (filtered-out, never-executed) DDL had been
+    applied — permanently hiding those pending changes from every later
+    diff. Silent schema drift; both lists must stay in lockstep."""
+    plan.ops = [op for op in plan.ops if op.plugin == plugin or op.table == "_bootstrap"]
+    plan.schemas = [s for s in plan.schemas if s.plugin == plugin]
 
 
 def _print_plan(plan: migrate.MigrationPlan) -> None:
@@ -228,7 +241,7 @@ def migrate_(
             async with provider.acquire() as conn:
                 the_plan = await migrate.build_plan(conn, schemas, patches, only_table=table)
                 if plugin:
-                    the_plan.ops = [op for op in the_plan.ops if op.plugin == plugin or op.table == "_bootstrap"]
+                    _scope_plan(the_plan, plugin)  # ops AND schemas — see _scope_plan
                 _print_plan(the_plan)
                 if the_plan.is_empty():
                     return

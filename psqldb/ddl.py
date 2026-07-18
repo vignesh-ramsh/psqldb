@@ -52,7 +52,11 @@ def _system_column_sql(f: Field, *, parent_table: str | None) -> str:
     if f.id in ("_created_at", "_updated_at"):
         return f'"{f.name}" TIMESTAMPTZ NOT NULL DEFAULT now()'
     if f.id in ("_created_by", "_updated_by"):
-        return f'"{f.name}" UUID'  # nullable, no FK — psqldb doesn't know a "users" table exists (§3.3)
+        # Stores the acting user's EMAIL, not a UUID — readable without a
+        # join to whatever users table (if any) exists. Nullable, no FK —
+        # psqldb doesn't know a "users" table exists (§3.3), which is also
+        # exactly why a UUID here was never resolvable at the psqldb layer.
+        return f'"{f.name}" TEXT'
     if f.id == "_state":
         return '"_state" INTEGER NOT NULL DEFAULT 0'
     raise AssertionError(f"unhandled system field id {f.id!r}")
@@ -211,11 +215,11 @@ BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
 
     """
     CREATE TABLE IF NOT EXISTS _trash (
-        id           UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+        id           UUID PRIMARY KEY DEFAULT arc_uuid_generate_v7(),
         "table"      TEXT NOT NULL,
         drop_type    TEXT NOT NULL CHECK (drop_type IN ('Table', 'Column', 'Row')),
         snapshot     JSONB NOT NULL,
-        deleted_by   UUID,
+        deleted_by   TEXT,
         deleted_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
         restored_at  TIMESTAMPTZ
     )
@@ -258,9 +262,12 @@ BOOTSTRAP_FUNCTIONS_SQL: list[str] = [
     $$ LANGUAGE plpgsql
     """,
 
-    # AFTER trigger: the UPDATE that set _state=99 has already committed by
-    # the time this runs, so deleting the row here doesn't fight the
-    # original statement. Snapshots OLD (the row as it was right before the
+    # AFTER trigger: it runs inside the SAME transaction as the UPDATE that
+    # set _state=99 (an AFTER ROW trigger fires after that statement's row
+    # change, NOT after commit — which is exactly what lets a rolled-back
+    # batch take its trash snapshots down with it), but after the row change
+    # is complete, so deleting the row here doesn't fight the original
+    # statement. Snapshots OLD (the row as it was right before the
     # delete) so a _trash row always holds real pre-delete business data —
     # recovery is then a plain re-insert, no special-casing for whatever
     # _state used to mean. Cascades to child tables via _field_registry
@@ -285,7 +292,7 @@ BOOTSTRAP_FUNCTIONS_SQL: list[str] = [
         -- ->>'...' just yields NULL when the key is absent, so this stays
         -- correct regardless of exactly which shape a given table has.
         INSERT INTO _trash ("table", drop_type, snapshot, deleted_by, deleted_at)
-        VALUES (TG_TABLE_NAME, 'Row', to_jsonb(OLD), (to_jsonb(NEW)->>'updated_by')::uuid, now());
+        VALUES (TG_TABLE_NAME, 'Row', to_jsonb(OLD), to_jsonb(NEW)->>'updated_by', now());
 
         -- This table's own TABLE-type fields point at its children (the
         -- field lives HERE, ref_table names the child table it owns) — NOT
@@ -314,11 +321,11 @@ def audit_table_sql(plugin: str) -> list[str]:
     return [
         f"""
         CREATE TABLE IF NOT EXISTS "{table}" (
-            id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+            id          UUID PRIMARY KEY DEFAULT arc_uuid_generate_v7(),
             "table"     TEXT NOT NULL,
             row_id      UUID NOT NULL,
             changes     JSONB NOT NULL,
-            changed_by  UUID,
+            changed_by  TEXT,
             changed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """,
@@ -344,7 +351,13 @@ def audit_table_sql(plugin: str) -> list[str]:
                     'before', CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE old_json END,
                     'after',  CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE new_json END
                 ),
-                COALESCE((new_json->>'updated_by')::uuid, (old_json->>'updated_by')::uuid)
+                -- updated_by first (an UPDATE's actor), then created_by (an
+                -- INSERT sets only created_by, so audit rows for inserts used
+                -- to record NULL — the row's creator was never captured).
+                COALESCE(
+                    new_json->>'updated_by', new_json->>'created_by',
+                    old_json->>'updated_by', old_json->>'created_by'
+                )
             );
             RETURN COALESCE(NEW, OLD);
         END;

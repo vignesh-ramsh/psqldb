@@ -98,6 +98,16 @@ class MigrationError(RuntimeError):
     pass
 
 
+def _q(value: Any) -> str:
+    """SQL string-literal escaping for the bookkeeping statements below
+    (registry/history upserts, trash snapshots) that are rendered as full
+    text rather than parameterized. Doubling single quotes is sufficient
+    for a standard-conforming-strings Postgres literal — without it, any
+    schema value containing an apostrophe (e.g. a field default of
+    \"O'Brien\") produced broken SQL and a failed migrate."""
+    return str(value).replace("'", "''")
+
+
 # ------------------------------------------------------------------------ #
 # Ordering + relational resolution — schemas only; patches never create a
 # table or own a child, so they never participate in this.
@@ -538,8 +548,8 @@ def _drop_column_op(schema: TableSchema, prev: dict, *, source: OpSource) -> Op:
     col = prev["name"]
     snapshot_sql = (
         f'INSERT INTO _trash ("table", drop_type, snapshot, deleted_at) '
-        f'SELECT \'{schema.table}\', \'Column\', '
-        f'jsonb_build_object(\'_row_id\', id, \'{col}\', "{col}"), now() '
+        f'SELECT \'{_q(schema.table)}\', \'Column\', '
+        f'jsonb_build_object(\'_row_id\', id, \'{_q(col)}\', "{col}"), now() '
         f'FROM "{schema.table}"'
     )
     drop_sql = f'ALTER TABLE "{schema.table}" DROP COLUMN "{col}"'
@@ -564,20 +574,26 @@ async def build_plan(
     bootstrapped = await introspect.bootstrap_applied(conn)
     plan = MigrationPlan()
 
+    # Shared trigger functions are CREATE OR REPLACE and re-applied on every
+    # migrate (not just the first) — see ddl.py's module docstring on why.
+    # Ordered BEFORE the structural bootstrap: _trash (and every _audit_*
+    # table) declares DEFAULT arc_uuid_generate_v7(), so the function must
+    # exist by the time those CREATE TABLE statements run. Creating the
+    # functions first is safe on a fresh database — plpgsql doesn't resolve
+    # gen_random_bytes()/table references until execution, so nothing here
+    # needs pgcrypto or _trash to exist yet.
+    plan.ops.append(Op(
+        kind="create_table", table="_bootstrap", plugin="psqldb",
+        description="ensure shared trigger functions (arc_uuid_generate_v7, "
+                    "arc_set_updated_at, arc_soft_delete_to_trash) are current",
+        sql=list(ddl.BOOTSTRAP_FUNCTIONS_SQL), destructive=False,
+    ))
     if not bootstrapped:
         plan.ops.append(Op(
             kind="create_table", table="_bootstrap", plugin="psqldb",
             description="bootstrap: pgcrypto extension, _field_registry, _trash, _patch_history",
             sql=list(ddl.BOOTSTRAP_STRUCTURAL_SQL), destructive=False,
         ))
-    # Shared trigger functions are CREATE OR REPLACE and re-applied on every
-    # migrate (not just the first) — see ddl.py's module docstring on why.
-    plan.ops.append(Op(
-        kind="create_table", table="_bootstrap", plugin="psqldb",
-        description="ensure shared trigger functions (arc_set_updated_at, "
-                    "arc_soft_delete_to_trash) are current",
-        sql=list(ddl.BOOTSTRAP_FUNCTIONS_SQL), destructive=False,
-    ))
 
     _resolve_child_owners(schemas)  # validates ownership; raises MigrationError on violation
     system_tables = {s.table for s in schemas if s.system}
@@ -697,12 +713,12 @@ async def _dropped_table_ops(conn: Any, declared: list[TableSchema]) -> list[Op]
         plugin = sorted(r["plugin"] for r in owners)[0] if owners else "unknown"
         snapshot_sql = (
             f'INSERT INTO _trash ("table", drop_type, snapshot, deleted_at) '
-            f'SELECT \'{table}\', \'Table\', to_jsonb(t), now() FROM "{table}" t'
+            f'SELECT \'{_q(table)}\', \'Table\', to_jsonb(t), now() FROM "{table}" t'
         )
         ops.append(Op(
             kind="drop_table", table=table, plugin=plugin,
             description=f'DROP TABLE "{table}" — every row snapshotted to _trash first',
-            sql=[snapshot_sql, f'DROP TABLE IF EXISTS "{table}"', f'DELETE FROM _field_registry WHERE "table" = \'{table}\''],
+            sql=[snapshot_sql, f'DROP TABLE IF EXISTS "{table}"', f'DELETE FROM _field_registry WHERE "table" = \'{_q(table)}\''],
             destructive=True,
         ))
     return ops
@@ -741,34 +757,37 @@ def registry_upsert_sql(schemas: list[TableSchema], ref_targets: dict[str, str])
         key = (schema.table, schema.plugin)
         if key not in seen_table_plugin:
             stmts.append(
-                f"DELETE FROM _field_registry WHERE \"table\" = '{schema.table}' "
-                f"AND plugin = '{schema.plugin}'"
+                f"DELETE FROM _field_registry WHERE \"table\" = '{_q(schema.table)}' "
+                f"AND plugin = '{_q(schema.plugin)}'"
             )
             seen_table_plugin.add(key)
         source = "patch" if schema.is_patch else "schema"
         for f in schema.fields:
             length = f.length if f.length is not None else "NULL"
-            default = f"'{f.default}'" if f.default is not None else "NULL"
-            ref_table = f"'{ref_targets[f.target]}'" if f.type in ("REFERENCE", "TABLE") else "NULL"
-            ref_field = f"'{f.target_field}'" if f.type == "REFERENCE" and f.target_field is not None else "NULL"
+            default = f"'{_q(f.default)}'" if f.default is not None else "NULL"
+            ref_table = f"'{_q(ref_targets[f.target])}'" if f.type in ("REFERENCE", "TABLE") else "NULL"
+            ref_field = f"'{_q(f.target_field)}'" if f.type == "REFERENCE" and f.target_field is not None else "NULL"
             stmts.append(
                 "INSERT INTO _field_registry "
                 '(id, name, "table", type, length, reqd, "unique", "default", ref_table, ref_field, source, plugin) '
-                f"VALUES ('{f.id}', '{f.name}', '{schema.table}', '{f.type}', {length}, "
-                f"{f.required}, {f.unique}, {default}, {ref_table}, {ref_field}, '{source}', '{schema.plugin}')"
+                f"VALUES ('{_q(f.id)}', '{_q(f.name)}', '{_q(schema.table)}', '{_q(f.type)}', {length}, "
+                f"{f.required}, {f.unique}, {default}, {ref_table}, {ref_field}, '{source}', '{_q(schema.plugin)}')"
             )
     return stmts
 
 
 def patch_history_sql(ops: list[Op], reference: str) -> list[str]:
     """One row per distinct (plugin, table, kind) actually touched by
-    `ops`. Bootstrap/infra ops (table names starting with "_", e.g. the
-    "_bootstrap" sentinel or an audit-table's own creation) are excluded —
-    this is a business-schema history, not an internal log."""
+    `ops`. Only psqldb's own infra ops are excluded — the "_bootstrap"
+    sentinel and "_audit_*" table creation. A business-declared
+    `"system": true` table (authn's `_users`, relay's `_job_log`, ...)
+    legitimately starts with "_" and IS part of the history — the earlier
+    blanket `startswith("_")` skip silently excluded every one of them,
+    contradicting this table's own "every applied change" contract."""
     seen: set[tuple[str, str, str]] = set()
     stmts = []
     for op in ops:
-        if op.table.startswith("_"):
+        if op.table == "_bootstrap" or op.table.startswith("_audit_"):
             continue
         key = (op.plugin, op.table, op.source)
         if key in seen:
@@ -776,7 +795,7 @@ def patch_history_sql(ops: list[Op], reference: str) -> list[str]:
         seen.add(key)
         stmts.append(
             'INSERT INTO _patch_history (plugin, "table", reference, kind) '
-            f"VALUES ('{op.plugin}', '{op.table}', '{reference}', '{op.source}') "
+            f"VALUES ('{_q(op.plugin)}', '{_q(op.table)}', '{_q(reference)}', '{op.source}') "
             'ON CONFLICT (plugin, "table", kind, reference) DO NOTHING'
         )
     return stmts

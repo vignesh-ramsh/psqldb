@@ -104,8 +104,13 @@ NORMAL_SYSTEM_FIELDS = [
     Field(id="_id", name="id", type="REFERENCE_PK"),  # rendered specially, see ddl.py
     Field(id="_created_at", name="created_at", type="DATETIME"),
     Field(id="_updated_at", name="updated_at", type="DATETIME"),
-    Field(id="_created_by", name="created_by", type="REFERENCE_UUID"),  # no FK target - psqldb doesn't know "users"
-    Field(id="_updated_by", name="updated_by", type="REFERENCE_UUID"),
+    # created_by/updated_by hold the acting user's EMAIL (a plain TEXT
+    # column, rendered specially in ddl.py) — readable without a join, and
+    # psqldb never has to know a "users" table exists (§3.3). TEXT is a real
+    # canonical type here (not a REFERENCE_* sentinel) so the Query Engine
+    # can filter/order on these columns like any other.
+    Field(id="_created_by", name="created_by", type="TEXT"),
+    Field(id="_updated_by", name="updated_by", type="TEXT"),
     Field(id="_state", name="_state", type="INT"),
 ]
 
@@ -117,11 +122,11 @@ CHILD_SYSTEM_FIELDS = [
     Field(id="_updated_at", name="updated_at", type="DATETIME"),
     # created_by/updated_by track who created/last-touched THIS child row
     # specifically — independent of the parent row's own created_by/updated_by,
-    # exactly the same per-row semantics NORMAL_SYSTEM_FIELDS already has above.
-    # No inheritance from the parent happens anywhere; a child row's audit
-    # fields have only ever meant "this row," parent included.
-    Field(id="_created_by", name="created_by", type="REFERENCE_UUID"),
-    Field(id="_updated_by", name="updated_by", type="REFERENCE_UUID"),
+    # exactly the same per-row semantics NORMAL_SYSTEM_FIELDS already has above
+    # (the acting user's email, TEXT). No inheritance from the parent happens
+    # anywhere; a child row's audit fields have only ever meant "this row."
+    Field(id="_created_by", name="created_by", type="TEXT"),
+    Field(id="_updated_by", name="updated_by", type="TEXT"),
     Field(id="_state", name="_state", type="INT"),
 ]
 

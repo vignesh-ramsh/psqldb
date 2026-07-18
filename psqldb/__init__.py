@@ -26,8 +26,17 @@ from uuid import UUID
 
 import asyncpg
 
+import arc  # arc.codec is stateless and importable pre-boot — same pattern relay/gateway use
+
 from . import fields, migrate, validation  # noqa: F401 - re-exported as arc.psqldb.fields / .migrate / .validation
-from .model import SchemaError, TableSchema, load_patches_dir, load_schemas_dir  # noqa: F401
+from .model import (  # noqa: F401
+    SchemaError,
+    TableSchema,
+    load_patch_file,
+    load_patches_dir,
+    load_schema_file,
+    load_schemas_dir,
+)
 from .validation import ValidationError  # noqa: F401
 
 CAPABILITY = "psqldb"
@@ -60,6 +69,23 @@ class PsqlDbProvider:
         self._schemas: list[TableSchema] = []
         self._by_table: dict[str, TableSchema] = {}
         self._patches: list[TableSchema] = []
+        # (plugin, directory) pairs exactly as register_model/
+        # register_patches received them — what reconcile() re-scans on a
+        # system.reload. Recorded rather than derived from source_paths so
+        # a directory that was EMPTY at boot (a plugin's first-ever schema
+        # authored later via admin's Schema Builder) is still watched.
+        self._model_dirs: list[tuple[str, Path]] = []
+        self._patch_dirs: list[tuple[str, Path]] = []
+        # Post-boot memoization: schemas/patches are immutable once every
+        # plugin's register() has run, but schema() (a patch merge) and
+        # ref_targets()/ref_columns() (a walk over EVERY plugin's every
+        # field) used to be recomputed on every single query build — a real
+        # per-request cost that grows with each installed plugin. All three
+        # caches are invalidated by register_model()/register_patches(),
+        # which only ever run during boot.
+        self._schema_cache: dict[str, TableSchema] = {}
+        self._ref_targets_cache: dict[str, str] | None = None
+        self._ref_columns_cache: dict[tuple[str, str], migrate.ddl.RefColumn] | None = None
 
     # ------------------------------------------------------------------ #
     # Schema registration — called from a business plugin's own
@@ -70,6 +96,7 @@ class PsqlDbProvider:
     # ------------------------------------------------------------------ #
     def register_model(self, schemas_dir: str | Path) -> list[TableSchema]:
         plugin = self._kernel.current_plugin() or "<direct>"
+        self._model_dirs.append((plugin, Path(schemas_dir)))
         schemas = load_schemas_dir(Path(schemas_dir), plugin=plugin)
         for schema in schemas:
             if schema.table in self._by_table:
@@ -81,6 +108,7 @@ class PsqlDbProvider:
                 )
             self._by_table[schema.table] = schema
         self._schemas.extend(schemas)
+        self._invalidate_schema_caches()
         return schemas
 
     def schemas(self) -> list[TableSchema]:
@@ -96,12 +124,129 @@ class PsqlDbProvider:
     # ------------------------------------------------------------------ #
     def register_patches(self, patches_dir: str | Path) -> list[TableSchema]:
         plugin = self._kernel.current_plugin() or "<direct>"
+        self._patch_dirs.append((plugin, Path(patches_dir)))
         patches = load_patches_dir(Path(patches_dir), plugin=plugin)
         self._patches.extend(patches)
+        self._invalidate_schema_caches()
         return patches
 
     def patches(self) -> list[TableSchema]:
         return list(self._patches)
+
+    def _invalidate_schema_caches(self) -> None:
+        self._schema_cache.clear()
+        self._ref_targets_cache = None
+        self._ref_columns_cache = None
+
+    # ------------------------------------------------------------------ #
+    # Live, table-scoped, IN-PROCESS reload — the in-memory half of
+    # admin's "Apply Now" (admin/api/schema_api.py). Call ONLY after the
+    # matching DDL has already been applied for real (migrate.apply_plan);
+    # this method itself never touches the database, it only makes THIS
+    # process's own registry agree with what the database now looks like.
+    # ------------------------------------------------------------------ #
+    def reload_schema_file(self, path: Path, *, plugin: str, is_patch: bool) -> TableSchema:
+        """Re-parses ONE schema/patch file from disk and replaces its entry
+        in this process's in-memory registry (self._schemas/_patches,
+        self._by_table) so every subsequent arc.relay/arc.psqldb read or
+        write in THIS process sees the new shape immediately — no restart
+        needed here. Matches (and replaces) the previous registration for
+        the same file by `source_path`; a file never seen before (a
+        brand-new table's first-ever apply) is simply appended, the same
+        outcome register_model() would have produced at boot.
+
+        `plugin`/`is_patch` are explicit rather than inferred: `plugin`
+        because Kernel.current_plugin() (what register_model/
+        register_patches normally rely on) is only valid during boot's own
+        register() call, §3.1 — there is no "current plugin" once the
+        process is serving requests; `is_patch` because a schema and a
+        patch for the same table are tracked as two separate, independent
+        entries (self._schemas vs self._patches), and only the caller
+        (which already knows which file it read) can say which one this is.
+
+        Deliberately narrow, matching the "in-process only" phase of this
+        feature (2026-07-17): this does NOT notify or reload any OTHER
+        process — a second Gateway worker, a `arc lineup worker`/
+        `scheduler` process, each keeps serving the shape it booted with
+        until it is itself restarted. Cross-process propagation (a redix
+        pub/sub broadcast + subscriber in every process, reloading on
+        receipt) is a deliberate later increment, not built yet — the
+        caller must say so in its own response."""
+        if is_patch:
+            schema = load_patch_file(path, plugin=plugin)
+            self._patches = [p for p in self._patches if p.source_path != path]
+            self._patches.append(schema)
+        else:
+            schema = load_schema_file(path, plugin=plugin)
+            self._schemas = [s for s in self._schemas if s.source_path != path]
+            self._schemas.append(schema)
+            self._by_table[schema.table] = schema
+        self._invalidate_schema_caches()
+        # Rich, process-local domain event (proposal §10) — local
+        # subscribers get full context; other processes only ever get the
+        # generic system.reload and reconcile from the source of truth.
+        # Fire-and-log semantics are emit()'s own; nothing here depends on
+        # any subscriber's outcome.
+        import asyncio as _asyncio
+
+        with contextlib.suppress(RuntimeError):  # no running loop (sync/test caller) — event skipped
+            _asyncio.get_running_loop()
+            _asyncio.ensure_future(
+                arc.events.emit("psqldb.schema.changed", table=schema.table, plugin=plugin)
+            )
+        return schema
+
+    # ------------------------------------------------------------------ #
+    # system.reload — full reconciliation against the source of truth
+    # (schema/patch FILES on disk), plus the reload stamp the kernel's
+    # process bridge polls (arc.events' duck-typed `reload_stamp()`).
+    # ------------------------------------------------------------------ #
+    async def reconcile(self, **_payload: Any) -> dict:
+        """Re-scan every schemas/patches directory registered at boot and
+        replace this process's ENTIRE in-memory registry with what disk
+        says now — new files appear, edited files update, deleted files
+        vanish. The arc.events "system.reload" handler (subscribed in
+        register() below).
+
+        Build-completely-THEN-swap, never clear-then-rebuild: parsing is
+        done into local variables first, so an in-flight request on this
+        worker never observes a half-empty registry, and a file that's
+        currently INVALID on disk aborts the whole reconcile with the old,
+        working state left fully intact (logged; the next reload retries).
+        The swap itself is a few plain attribute assignments with no await
+        between them — atomic enough under the GIL for every reader here."""
+        new_schemas: list[TableSchema] = []
+        new_by_table: dict[str, TableSchema] = {}
+        new_patches: list[TableSchema] = []
+        for plugin, directory in self._model_dirs:
+            for schema in load_schemas_dir(directory, plugin=plugin):
+                if schema.table in new_by_table:
+                    raise SchemaError(
+                        f"reconcile: table '{schema.table}' is declared by both plugin "
+                        f"'{new_by_table[schema.table].plugin}' and '{plugin}'."
+                    )
+                new_by_table[schema.table] = schema
+                new_schemas.append(schema)
+        for plugin, directory in self._patch_dirs:
+            new_patches.extend(load_patches_dir(directory, plugin=plugin))
+
+        self._schemas = new_schemas
+        self._by_table = new_by_table
+        self._patches = new_patches
+        self._invalidate_schema_caches()
+        return {"tables": len(new_schemas), "patches": len(new_patches)}
+
+    async def reload_stamp(self) -> Any:
+        """Duck-typed contract for arc.events' process bridge: an opaque
+        token that changes whenever this capability's reloadable state may
+        have changed. _patch_history.applied_at moves on EVERY schema
+        apply, from any process (`arc psqldb migrate`, admin's Apply Now)
+        — the DB itself is the notification medium, so no redix, no
+        supervisor, no configuration is needed for cross-process schema
+        propagation (proposal §9/§14). Pre-bootstrap (table doesn't exist
+        yet) returns None — the bridge treats an erroring/absent stamp as
+        'no vote this tick', never a failure."""
+        return await self.fetch_val("SELECT max(applied_at) FROM _patch_history")
 
     def schema(self, table: str) -> TableSchema:
         """The table's CURRENT shape — its own schema's fields plus every
@@ -125,6 +270,9 @@ class PsqlDbProvider:
         ownership-scoped diffing in _diff_table needs schema and patches
         kept SEPARATE (self._schemas / self._patches), and works from
         those directly."""
+        cached = self._schema_cache.get(table)
+        if cached is not None:
+            return cached
         try:
             base = self._by_table[table]
         except KeyError:
@@ -134,38 +282,53 @@ class PsqlDbProvider:
             ) from None
         patch_fields = [f for p in self._patches if p.table == table for f in p.fields]
         if not patch_fields:
-            return base
-        merged: dict[str, Any] = {f.id: f for f in base.fields}
-        for f in patch_fields:
-            merged[f.id] = f
-        from dataclasses import replace
-        return replace(base, fields=list(merged.values()))
+            result = base
+        else:
+            merged: dict[str, Any] = {f.id: f for f in base.fields}
+            for f in patch_fields:
+                merged[f.id] = f
+            from dataclasses import replace
+            result = replace(base, fields=list(merged.values()))
+        self._schema_cache[table] = result
+        return result
 
     def ref_targets(self) -> dict[str, str]:
-        return migrate.resolve_ref_targets([*self._schemas, *self._patches])
+        if self._ref_targets_cache is None:
+            self._ref_targets_cache = migrate.resolve_ref_targets([*self._schemas, *self._patches])
+        return self._ref_targets_cache
 
     def ref_columns(self) -> dict[tuple[str, str], migrate.ddl.RefColumn]:
         """(owning table, field name) -> resolved target (table, column,
         real SQL type) for every REFERENCE field — see
-        migrate.resolve_ref_columns. Recomputed on every call, same as
-        ref_targets() above (schemas don't change after boot, so this is
-        cheap and never worth caching)."""
-        return migrate.resolve_ref_columns([*self._schemas, *self._patches], self.ref_targets())
+        migrate.resolve_ref_columns. Memoized after boot: relay's query
+        builder calls this per query, and the resolution walks every
+        plugin's every field — schemas are immutable once boot completes,
+        so recomputing it each time was pure per-request cost."""
+        if self._ref_columns_cache is None:
+            self._ref_columns_cache = migrate.resolve_ref_columns(
+                [*self._schemas, *self._patches], self.ref_targets()
+            )
+        return self._ref_columns_cache
 
     async def open(self) -> None:
         """Create the pool. Idempotent — safe to call more than once.
         Registers a json/jsonb codec on every connection so JSON-typed
         columns (business JSON fields, and _trash.snapshot) round-trip as
         Python dict/list — asyncpg returns raw text for json/jsonb by
-        default, which is surprising for every caller of insert()/get()."""
-        import json as _json
+        default, which is surprising for every caller of insert()/get().
+        Serialization goes through arc.codec (§3.10's one shared codec),
+        not stdlib json — set_type_codec wants str, so encode()'s bytes
+        are decoded once here."""
+
+        def _encode_json(value: Any) -> str:
+            return arc.codec.encode(value).decode()
 
         async def _init_connection(conn: asyncpg.Connection) -> None:
             await conn.set_type_codec(
-                "jsonb", encoder=_json.dumps, decoder=_json.loads, schema="pg_catalog"
+                "jsonb", encoder=_encode_json, decoder=arc.codec.decode, schema="pg_catalog"
             )
             await conn.set_type_codec(
-                "json", encoder=_json.dumps, decoder=_json.loads, schema="pg_catalog"
+                "json", encoder=_encode_json, decoder=arc.codec.decode, schema="pg_catalog"
             )
 
         if self._pool is None:
@@ -228,7 +391,7 @@ class PsqlDbProvider:
     # Relay's future engine wraps these with hooks/RBAC/query bounds; it
     # doesn't reinvent field validation or the soft-delete contract below.
     # ------------------------------------------------------------------ #
-    async def insert(self, table: str, data: dict[str, Any], *, created_by: UUID | None = None, conn: Any = None) -> asyncpg.Record:
+    async def insert(self, table: str, data: dict[str, Any], *, created_by: str | None = None, conn: Any = None) -> asyncpg.Record:
         schema = self.schema(table)
         clean = {k: v for k, v in data.items() if k not in _SYSTEM_COLUMN_NAMES}
         validation.validate_row(schema, clean)
@@ -249,7 +412,7 @@ class PsqlDbProvider:
             except asyncpg.UniqueViolationError as exc:
                 raise validation.friendly_unique_error(exc, table=table) from exc
 
-    async def update(self, table: str, id: UUID, data: dict[str, Any], *, updated_by: UUID | None = None, conn: Any = None) -> asyncpg.Record | None:
+    async def update(self, table: str, id: UUID, data: dict[str, Any], *, updated_by: str | None = None, conn: Any = None) -> asyncpg.Record | None:
         schema = self.schema(table)
         clean = {k: v for k, v in data.items() if k not in _SYSTEM_COLUMN_NAMES}
         validation.validate_row(schema, clean)
@@ -260,6 +423,14 @@ class PsqlDbProvider:
             if updated_by is not None:
                 columns.append("updated_by")
                 clean = {**clean, "updated_by": updated_by}
+            if not columns:
+                # Nothing to set — an empty SET clause is a Postgres syntax
+                # error, and this is reachable through a perfectly ordinary
+                # call (save(table, data, match_on=...) where data only
+                # carries the match_on fields). A clean no-op returning the
+                # current row keeps save()'s "returns the persisted row"
+                # contract intact.
+                return await c.fetchrow(f'SELECT * FROM "{table}" WHERE id = $1', id)
             set_clause = ", ".join(f'"{col}" = ${i + 2}' for i, col in enumerate(columns))
             query = f'UPDATE "{table}" SET {set_clause} WHERE id = $1 RETURNING *'
             try:
@@ -269,7 +440,7 @@ class PsqlDbProvider:
             except asyncpg.UniqueViolationError as exc:
                 raise validation.friendly_unique_error(exc, table=table) from exc
 
-    async def soft_delete(self, table: str, id: UUID, *, deleted_by: UUID | None = None, conn: Any = None) -> None:
+    async def soft_delete(self, table: str, id: UUID, *, deleted_by: str | None = None, conn: Any = None) -> None:
         """Never a hard DELETE for a normal/child table — sets `_state = 99`.
         The DB-level arc_soft_delete_to_trash trigger (psqldb.ddl) takes it
         from there: snapshots the row into `_trash`, cascades to any child
@@ -320,7 +491,7 @@ class PsqlDbProvider:
                 )
         return sorted(columns)
 
-    async def insert_many(self, table: str, rows: list[dict[str, Any]], *, created_by: UUID | None = None, conn: Any = None) -> list[asyncpg.Record]:
+    async def insert_many(self, table: str, rows: list[dict[str, Any]], *, created_by: str | None = None, conn: Any = None) -> list[asyncpg.Record]:
         if not rows:
             return []
         schema = self.schema(table)
@@ -350,7 +521,7 @@ class PsqlDbProvider:
             except asyncpg.UniqueViolationError as exc:
                 raise validation.friendly_unique_error(exc, table=table) from exc
 
-    async def update_many(self, table: str, updates: list[dict[str, Any]], *, updated_by: UUID | None = None, conn: Any = None) -> list[asyncpg.Record]:
+    async def update_many(self, table: str, updates: list[dict[str, Any]], *, updated_by: str | None = None, conn: Any = None) -> list[asyncpg.Record]:
         """`updates` is `[{"id": ..., "data": {...}}, ...]` — every entry's
         `data` must update the same fields, same homogeneity rule as
         insert_many."""
@@ -370,6 +541,10 @@ class PsqlDbProvider:
         if updated_by is not None:
             columns = [*columns, "updated_by"]
             cleaned = [{**c, "updated_by": updated_by} for c in cleaned]
+        if not columns:
+            # Same empty-SET guard as update() above — return the current
+            # rows unchanged rather than rendering invalid SQL.
+            return await self.get_many(table, ids, conn=conn)
 
         async with self._conn_or(conn) as c:
             # Every value in an anonymous VALUES(...) list needs an explicit
@@ -418,7 +593,7 @@ class PsqlDbProvider:
             except asyncpg.UniqueViolationError as exc:
                 raise validation.friendly_unique_error(exc, table=table) from exc
 
-    async def soft_delete_many(self, table: str, ids: list[UUID], *, deleted_by: UUID | None = None, conn: Any = None) -> None:
+    async def soft_delete_many(self, table: str, ids: list[UUID], *, deleted_by: str | None = None, conn: Any = None) -> None:
         if not ids:
             return
         schema = self.schema(table)
@@ -438,7 +613,7 @@ class PsqlDbProvider:
         async with self._conn_or(conn) as c:
             return await c.fetch(f'SELECT * FROM "{table}" WHERE id = ANY($1::uuid[])', ids)
 
-    async def clear(self, table: str, *, cleared_by: UUID | None = None) -> int:
+    async def clear(self, table: str, *, cleared_by: str | None = None) -> int:
         """`arc psqldb clear` — every row in `table` goes through the same
         soft-delete-to-trash trigger as a single soft_delete() would, not a
         raw TRUNCATE: recoverable from _trash, and cascades to child tables
@@ -550,23 +725,10 @@ class PsqlDbProvider:
         async with self._conn_or(conn) as c:
             return await c.fetchrow(f'SELECT * FROM "{table}" WHERE id = $1', id)
 
-    async def get_by(self, table: str, filters: dict[str, Any], *, conn: Any = None) -> asyncpg.Record | None:
-        """Single-row lookup by any field(s), not just id — equality only,
-        first match. A deliberately minimal slice of the still-undesigned
-        bounded Query Engine (§3.4): built because a real need for it
-        surfaced (looking a row up by a business key, not its UUID), not a
-        first piece of that larger, separate system."""
-        schema = self.schema(table)
-        if not filters:
-            raise ValueError("get_by() requires at least one filter.")
-        known = {f.name for f in schema.all_fields() if f.is_column()}
-        unknown = [k for k in filters if k not in known]
-        if unknown:
-            raise ValueError(f"get_by(): unknown field(s) {unknown} on table '{table}'.")
-        async with self._conn_or(conn) as c:
-            where = " AND ".join(f'"{k}" = ${i + 1}' for i, k in enumerate(filters))
-            query = f'SELECT * FROM "{table}" WHERE {where} LIMIT 1'
-            return await c.fetchrow(query, *filters.values())
+    # get_by() is gone (docs/arc.MD §3.11): it was a narrow single-field-
+    # equality stopgap superseded by arc.relay.get(table, {field: value}),
+    # which validates through the real Query Engine. Nothing in-tree called
+    # it anymore — removed rather than left as a second, weaker filter path.
 
 
 def register(kernel: Any) -> None:
@@ -586,3 +748,8 @@ def register(kernel: Any) -> None:
 
     provider = PsqlDbProvider(kernel, dsn, min_size=min_size, max_size=max_size)
     kernel.export(CAPABILITY, provider, requires=[], optional_requires=[])
+    # system.reload -> full re-scan of every registered schemas/patches
+    # directory (see reconcile()'s own docstring). Subscribed here, inside
+    # register(), so the subscription is attributed to "psqldb" and dies
+    # with this kernel on a re-boot (arc.events' per-Kernel registry).
+    arc.events.on(arc.events.RELOAD_EVENT, provider.reconcile)
