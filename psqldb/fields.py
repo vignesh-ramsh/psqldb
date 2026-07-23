@@ -107,6 +107,13 @@ class Field:
     scale: int | None = None
     default: Any = None
     options: tuple[str, ...] | None = None  # SELECT only — a fixed choice list
+    list: bool = True  # UI-only (admin's Data Browser table/list view, docs/
+                        # admin-ui-ux-review.md #4) — NOT a DDL/storage concern,
+                        # psqldb.ddl never reads this. Default True so every
+                        # already-authored schema keeps showing every column
+                        # unless a plugin explicitly opts a field OUT (e.g. a
+                        # verbose JSON/MULTIFILE blob that's fine in the row
+                        # editor but clutters a table view of many rows).
     target: str | None = None      # REFERENCE / TABLE only — table this points to
     target_field: str | None = None  # REFERENCE only — which field on `target` this
                                       # points at. None = the implicit PK ("id") — the
@@ -167,6 +174,7 @@ def parse_field(raw: dict, *, table: str, index: int) -> Field:
     required = bool(raw.get("required", raw.get("req", False)))
     unique = bool(raw.get("unique", False))
     primary_key = bool(raw.get("primary_key", False))
+    list_in_view = bool(raw.get("list", True))
     length = raw.get("length")
     precision = raw.get("precision")
     scale = raw.get("scale")
@@ -205,4 +213,5 @@ def parse_field(raw: dict, *, table: str, index: int) -> Field:
         id=field_id, name=name, type=ftype, required=required, unique=unique,
         primary_key=primary_key, length=length, precision=precision, scale=scale,
         default=default, options=options, target=target, target_field=target_field,
+        list=list_in_view,
     )
