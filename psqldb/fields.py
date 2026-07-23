@@ -44,6 +44,18 @@ _SQL_TEMPLATES: dict[str, str] = {
     "SELECT": "VARCHAR({length})",
     "REFERENCE": "UUID",
     "UUID": "UUID",
+    # FILE/MULTIFILE (docs/filer-attachment-storage-proposal.md) — deliberately
+    # NOT relational: no `target` required (unlike REFERENCE/TABLE), no DB-level
+    # foreign key. A FILE column stores a `filer` FilerFile.file_id (a fixed-
+    # shape opaque handle, not a UUID) — psqldb only owns the column shape;
+    # whether the value resolves to a real, servable file is validated at the
+    # relay-hook layer (filer's own after_save/validate hooks), the same
+    # "DB tier only enforces shape, app tier enforces meaning" split SELECT's
+    # options list already uses. MULTIFILE is a plain JSONB array of
+    # {"label": ..., "fileid": ...} objects, structurally identical to JSON —
+    # its element shape is likewise an app-tier concern, not a DDL one.
+    "FILE": "VARCHAR(32)",
+    "MULTIFILE": "JSONB",
 }
 
 RELATIONAL_TYPES = frozenset({"REFERENCE", "TABLE"})

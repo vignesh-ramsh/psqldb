@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import contextlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from uuid import UUID
 
 import asyncpg
@@ -86,6 +86,18 @@ class PsqlDbProvider:
         self._schema_cache: dict[str, TableSchema] = {}
         self._ref_targets_cache: dict[str, str] | None = None
         self._ref_columns_cache: dict[tuple[str, str], migrate.ddl.RefColumn] | None = None
+        # Plain observer list, fired once per table at the end of every
+        # register_model() call — exists so a plugin whose OWN register()
+        # runs before some other plugin's schema is registered (topological
+        # order, §3.1) can still react to that schema once it does show up,
+        # without psqldb needing to know or care who's listening or why. The
+        # kernel has no "every plugin has finished booting" phase (arc.runtime
+        # .boot() just runs each register() in order and returns), so this —
+        # not a one-shot post-boot hook — is what makes a subscriber's own
+        # discovery boot-order-independent. See docs/filer-attachment-storage
+        # -proposal.md §4 for the motivating case (filer discovering every
+        # FILE/MULTIFILE field regardless of load order).
+        self._on_schema_registered: list[Callable[[str], None]] = []
 
     # ------------------------------------------------------------------ #
     # Schema registration — called from a business plugin's own
@@ -109,10 +121,28 @@ class PsqlDbProvider:
             self._by_table[schema.table] = schema
         self._schemas.extend(schemas)
         self._invalidate_schema_caches()
+        for schema in schemas:
+            for callback in self._on_schema_registered:
+                callback(schema.table)
         return schemas
 
     def schemas(self) -> list[TableSchema]:
         return list(self._schemas)
+
+    def on_schema_registered(self, callback: Callable[[str], None]) -> None:
+        """Subscribe to be called with `table` once for every schema OR
+        patch this process registers from here on — NOT retroactively for
+        ones already registered before this call (a subscriber that also
+        cares about those should walk `schemas()` once, itself, right
+        after subscribing; see filer's own register() for the two-part
+        pattern this exists for). Patches fire this too, deliberately: a
+        patch can add a field (e.g. filer's FILE/MULTIFILE) to a table
+        whose base schema was registered long before this subscriber
+        existed — `table` is what's passed either way, so a subscriber
+        that re-derives its interest from `psqldb.schema(table)` (the
+        merged, patches-included view) sees the correct current shape
+        regardless of which registration call actually triggered it."""
+        self._on_schema_registered.append(callback)
 
     # ------------------------------------------------------------------ #
     # Patch registration — `arc.psqldb.register_patches(Path(__file__).parent / "patches")`.
@@ -128,6 +158,9 @@ class PsqlDbProvider:
         patches = load_patches_dir(Path(patches_dir), plugin=plugin)
         self._patches.extend(patches)
         self._invalidate_schema_caches()
+        for patch in patches:
+            for callback in self._on_schema_registered:
+                callback(patch.table)
         return patches
 
     def patches(self) -> list[TableSchema]:
