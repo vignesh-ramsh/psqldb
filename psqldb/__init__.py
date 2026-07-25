@@ -351,7 +351,18 @@ class PsqlDbProvider:
         default, which is surprising for every caller of insert()/get().
         Serialization goes through arc.codec (§3.10's one shared codec),
         not stdlib json — set_type_codec wants str, so encode()'s bytes
-        are decoded once here."""
+        are decoded once here.
+
+        Also sets the session's own `TimeZone` to arc.tz.server_timezone()
+        (arc_server_timezone setting, default UTC) on every connection.
+        This is what makes DATETIME (TIMESTAMPTZ) columns read/write in
+        the configured zone rather than whatever the server process's own
+        environment happens to default to: TIMESTAMPTZ always stores a
+        real UTC instant internally (that part Postgres never changes),
+        but converts to/from that instant using the SESSION's timezone on
+        every read and write — so setting it once per connection, here,
+        is the one place this needs to happen; nothing downstream (relay,
+        the Query Engine, a business plugin) has to do its own UTC math."""
 
         def _encode_json(value: Any) -> str:
             return arc.codec.encode(value).decode()
@@ -362,6 +373,12 @@ class PsqlDbProvider:
             )
             await conn.set_type_codec(
                 "json", encoder=_encode_json, decoder=arc.codec.decode, schema="pg_catalog"
+            )
+            # set_config (not a raw `SET TIME ZONE '<value>'` string) so the
+            # configured zone name is a real bound parameter, never
+            # interpolated into SQL text.
+            await conn.execute(
+                "SELECT set_config('TimeZone', $1, false)", str(arc.tz.server_timezone())
             )
 
         if self._pool is None:
@@ -766,8 +783,22 @@ class PsqlDbProvider:
 
 def register(kernel: Any) -> None:
     kernel.settings.declare(DSN_KEY, secret=True)
-    kernel.settings.declare(POOL_MIN_SIZE_KEY)
-    kernel.settings.declare(POOL_MAX_SIZE_KEY)
+    # Typed declare (§1 P0, Improvement Doc's own example key): get() below
+    # now returns a real int, defaulting to 1/10 when unset, and a bad
+    # value (non-numeric, hand-edited arc.toml) fails at arc.boot() with a
+    # clear message instead of this register() raising a bare ValueError.
+    kernel.settings.declare(
+        POOL_MIN_SIZE_KEY,
+        type=int,
+        default=1,
+        doc="Minimum size of the asyncpg connection pool.",
+    )
+    kernel.settings.declare(
+        POOL_MAX_SIZE_KEY,
+        type=int,
+        default=10,
+        doc="Maximum size of the asyncpg connection pool.",
+    )
 
     dsn = kernel.settings.get(DSN_KEY, reveal=True)
     if dsn is None:
@@ -776,8 +807,8 @@ def register(kernel: Any) -> None:
             f"arc settings set {DSN_KEY} postgresql://user:pass@host:5432/dbname --secret"
         )
 
-    min_size = int(kernel.settings.get(POOL_MIN_SIZE_KEY) or 1)
-    max_size = int(kernel.settings.get(POOL_MAX_SIZE_KEY) or 10)
+    min_size = kernel.settings.get(POOL_MIN_SIZE_KEY)
+    max_size = kernel.settings.get(POOL_MAX_SIZE_KEY)
 
     provider = PsqlDbProvider(kernel, dsn, min_size=min_size, max_size=max_size)
     kernel.export(CAPABILITY, provider, requires=[], optional_requires=[])

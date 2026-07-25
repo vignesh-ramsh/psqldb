@@ -28,6 +28,7 @@ import asyncpg
 import typer
 from rich.console import Console
 
+import arc
 from arc.runtime import find_project_root
 from arc.settings import SettingsManager
 
@@ -127,8 +128,6 @@ def connect() -> None:
 # pattern as `arc gateway routes`.
 # ------------------------------------------------------------------------ #
 def _boot() -> "PsqlDbProvider":  # noqa: F821 - forward ref, avoids importing arc's own psqldb attribute at module load
-    import arc
-
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", arc.ArcAdvisory)
         arc.boot()
@@ -159,25 +158,28 @@ def _root_or_exit() -> Path:
     return root
 
 
-async def _build_plan(plugin: str | None, table: str | None) -> tuple[object, migrate.MigrationPlan]:
+def _build_plan(plugin: str | None, table: str | None) -> migrate.MigrationPlan:
+    # The plugin-existence check needs boot()'s registered schemas/patches
+    # but no live connection — done up front, sync, so a typo'd -p exits
+    # before arc.runtime.run_async ever opens a pool for it.
     provider = _boot()
     if plugin and not any(
         s.plugin == plugin for s in [*provider.schemas(), *provider.patches()]
     ):
         err_console.print(f"No schemas or patches registered for plugin '{plugin}'.")
         raise typer.Exit(code=1)
-    await provider.open()
-    try:
-        async with provider.acquire() as conn:
+
+    async def _do() -> migrate.MigrationPlan:
+        async with arc.psqldb.acquire() as conn:
             # Always diff the FULL schema set (a -p scope must not make other
             # plugins' tables look "no longer declared" to _dropped_table_ops),
             # then narrow both ops AND schemas to the scope — see _scope_plan.
-            plan = await migrate.build_plan(conn, provider.schemas(), provider.patches(), only_table=table)
+            the_plan = await migrate.build_plan(conn, arc.psqldb.schemas(), arc.psqldb.patches(), only_table=table)
             if plugin:
-                _scope_plan(plan, plugin)
-    finally:
-        await provider.close()
-    return provider, plan
+                _scope_plan(the_plan, plugin)
+            return the_plan
+
+    return arc.runtime.run_async(_do(), open=("psqldb",))
 
 
 def _scope_plan(plan: migrate.MigrationPlan, plugin: str) -> None:
@@ -206,6 +208,112 @@ def _print_plan(plan: migrate.MigrationPlan) -> None:
         console.print(f"[yellow]warning:[/yellow] {warning}")
 
 
+SCHEMA_DIR_NAME = "schema"  # under .arc/ — where the generated local JSON Schema files live
+
+
+@app.command()
+def check(
+    write_schema: bool = typer.Option(
+        False, "--write-schema",
+        help="Also (re)write the local JSON Schema files under .arc/schema/ and wire "
+        ".vscode/settings.json to point every schemas/*.json and patches/*.json file at "
+        "them, for editor autocomplete. Safe to re-run any time schema_spec.py changes.",
+    ),
+) -> None:
+    """Validate every schemas/*.json and patches/*.json file across every
+    plugin in the project — structural shape first (psqldb.schema_spec:
+    unknown keys, wrong JSON types, an unrecognized `type` name — entirely
+    local, no database, no network), then the existing business-rule
+    checks (a unique field is required, primary_key is UUID-only, ...)
+    layered on top exactly as they already run during `arc psqldb plan`/
+    `migrate`. Unlike those commands, this never stops at the first bad
+    plugin — it checks every plugin and reports every problem in one pass,
+    so `arc psqldb plan` failing on file #1 doesn't hide a second, unrelated
+    mistake in file #7."""
+    root = _root_or_exit()
+    from arc import registry
+
+    from .model import SchemaError, load_patches_dir, load_schemas_dir
+
+    manifests = registry.discover_plugins(root / "plugins")
+    total = 0
+    problems: list[tuple[str, str]] = []
+    for m in manifests:
+        pkg_dir = m.source_dir / m.name
+        for loader, subdir in ((load_schemas_dir, "schemas"), (load_patches_dir, "patches")):
+            d = pkg_dir / subdir
+            if not d.exists() or not any(d.glob("*.json")):
+                continue
+            try:
+                items = loader(d, plugin=m.name)
+            except SchemaError as exc:
+                problems.append((m.name, str(exc)))
+            else:
+                total += len(items)
+
+    if write_schema:
+        _write_local_schemas(root)
+
+    if problems:
+        err_console.print(f"[bold red]{len(problems)} plugin(s) with problems[/bold red] (checked {total} file(s) OK elsewhere):")
+        for plugin_name, message in problems:
+            err_console.print(f"  [bold]{plugin_name}[/bold]: {message}")
+        raise typer.Exit(code=1)
+    console.print(
+        f"[bold green]OK[/bold green] — {total} schema/patch file(s) across "
+        f"{len(manifests)} plugin(s), no problems found."
+    )
+
+
+def _write_local_schemas(root: Path) -> None:
+    """Writes the two generated JSON Schema documents to .arc/schema/, and
+    wires .vscode/settings.json's json.schemas to point every
+    plugins/*/schemas/*.json and plugins/*/patches/*.json file at them —
+    editor autocomplete, fully local (file paths, never a URL). Merges
+    into an existing settings.json rather than overwriting it; safe to
+    re-run any time schema_spec.py's Structs change."""
+    import json as _json
+
+    from . import schema_spec
+
+    schema_dir = root / ".arc" / SCHEMA_DIR_NAME
+    schema_dir.mkdir(parents=True, exist_ok=True)
+    schema_path = schema_dir / "psqldb-schema.schema.json"
+    patch_path = schema_dir / "psqldb-patch.schema.json"
+    schema_path.write_text(_json.dumps(schema_spec.schema_json(), indent=2) + "\n")
+    patch_path.write_text(_json.dumps(schema_spec.patch_schema_json(), indent=2) + "\n")
+    console.print(f"[dim]wrote {schema_path}[/dim]")
+    console.print(f"[dim]wrote {patch_path}[/dim]")
+
+    vscode_dir = root / ".vscode"
+    vscode_dir.mkdir(exist_ok=True)
+    settings_path = vscode_dir / "settings.json"
+    try:
+        settings = _json.loads(settings_path.read_text()) if settings_path.exists() else {}
+    except _json.JSONDecodeError:
+        err_console.print(
+            f"[yellow]warning:[/yellow] {settings_path} is not valid JSON — leaving it "
+            f"untouched. Add the json.schemas mapping to it by hand if you want editor "
+            f"autocomplete (see .arc/schema/*.schema.json)."
+        )
+        return
+
+    schemas_entry = {
+        "fileMatch": ["plugins/*/*/schemas/*.json"],
+        "url": "./.arc/schema/psqldb-schema.schema.json",
+    }
+    patches_entry = {
+        "fileMatch": ["plugins/*/*/patches/*.json"],
+        "url": "./.arc/schema/psqldb-patch.schema.json",
+    }
+    existing = settings.setdefault("json.schemas", [])
+    for entry in (schemas_entry, patches_entry):
+        if entry not in existing:
+            existing.append(entry)
+    settings_path.write_text(_json.dumps(settings, indent=2) + "\n")
+    console.print(f"[dim]updated {settings_path}[/dim]")
+
+
 @app.command()
 def plan(
     plugin: str = typer.Option(None, "-p", "--plugin", help="Only show changes for this plugin's schemas/patches."),
@@ -214,7 +322,7 @@ def plan(
     """Preview what `arc psqldb migrate` would do — never touches the database."""
     _root_or_exit()
     with _friendly_errors():
-        _provider, the_plan = asyncio.run(_build_plan(plugin, table))
+        the_plan = _build_plan(plugin, table)
         _print_plan(the_plan)
 
 
@@ -230,39 +338,38 @@ def migrate_(
     are always recoverable from _trash, but are still shown in red."""
     root = _root_or_exit()
 
-    async def _run():
-        provider = _boot()
+    async def _do() -> None:
+        # boot() already ran (arc.runtime.run_async does it before opening
+        # psqldb below) — arc.psqldb IS the same provider _boot() used to
+        # return separately.
+        provider = arc.psqldb
         schemas, patches = provider.schemas(), provider.patches()
         target_plugins = {s.plugin for s in schemas if not plugin or s.plugin == plugin} | \
                           {p.plugin for p in patches if not plugin or p.plugin == plugin}
         reference = migrate.migration_reference()
-        await provider.open()
-        try:
-            async with provider.acquire() as conn:
-                the_plan = await migrate.build_plan(conn, schemas, patches, only_table=table)
-                if plugin:
-                    _scope_plan(the_plan, plugin)  # ops AND schemas — see _scope_plan
-                _print_plan(the_plan)
-                if the_plan.is_empty():
-                    return
-                if not yes and not typer.confirm("Proceed?", default=False):
-                    console.print("[dim]Aborted — nothing applied.[/dim]")
-                    raise typer.Exit(code=1)
-                await migrate.apply_plan(conn, the_plan, reference=reference)
-            for plugin_name in sorted(target_plugins):
-                plugin_ops_plan = migrate.MigrationPlan(
-                    ops=[op for op in the_plan.ops if op.plugin == plugin_name]
+        async with provider.acquire() as conn:
+            the_plan = await migrate.build_plan(conn, schemas, patches, only_table=table)
+            if plugin:
+                _scope_plan(the_plan, plugin)  # ops AND schemas — see _scope_plan
+            _print_plan(the_plan)
+            if the_plan.is_empty():
+                return
+            if not yes and not typer.confirm("Proceed?", default=False):
+                console.print("[dim]Aborted — nothing applied.[/dim]")
+                raise typer.Exit(code=1)
+            await migrate.apply_plan(conn, the_plan, reference=reference)
+        for plugin_name in sorted(target_plugins):
+            plugin_ops_plan = migrate.MigrationPlan(
+                ops=[op for op in the_plan.ops if op.plugin == plugin_name]
+            )
+            if plugin_ops_plan.ops:
+                path = migrate.write_migration_file(
+                    root / "plugins" / plugin_name, plugin_name, plugin_ops_plan, reference
                 )
-                if plugin_ops_plan.ops:
-                    path = migrate.write_migration_file(
-                        root / "plugins" / plugin_name, plugin_name, plugin_ops_plan, reference
-                    )
-                    console.print(f"[dim]wrote {path}[/dim]")
-        finally:
-            await provider.close()
+                console.print(f"[dim]wrote {path}[/dim]")
 
     with _friendly_errors():
-        asyncio.run(_run())
+        arc.runtime.run_async(_do(), open=("psqldb",))
     console.print("[bold green]Migration complete.[/bold green]")
 
 
@@ -320,36 +427,35 @@ def clear(
         err_console.print("Specify -t/--table or -p/--plugin — `clear` never runs unscoped.")
         raise typer.Exit(code=1)
 
-    async def _run():
-        from .migrate import order_for_clear
+    from .migrate import order_for_clear
 
-        provider = _boot()
-        tables = {table} if table else {s.table for s in provider.schemas() if s.plugin == plugin}
-        if plugin and not tables:
-            err_console.print(f"No schemas registered for plugin '{plugin}'.")
-            raise typer.Exit(code=1)
+    # Boot + compute the scope + confirm BEFORE opening a pool at all
+    # (unchanged from before this used arc.runtime.run_async) — an aborted
+    # confirmation should never have opened a connection in the first place.
+    provider = _boot()
+    tables = {table} if table else {s.table for s in provider.schemas() if s.plugin == plugin}
+    if plugin and not tables:
+        err_console.print(f"No schemas registered for plugin '{plugin}'.")
+        raise typer.Exit(code=1)
 
-        # Order matters: a table REFERENCING another (ON DELETE RESTRICT)
-        # must be cleared first, or the soft-delete trigger's physical
-        # DELETE on the referenced table hits a live FK violation the
-        # moment some other row in this same clear still points at it.
-        ordered = order_for_clear(tables, provider.ref_columns()) if len(tables) > 1 else sorted(tables)
+    # Order matters: a table REFERENCING another (ON DELETE RESTRICT)
+    # must be cleared first, or the soft-delete trigger's physical
+    # DELETE on the referenced table hits a live FK violation the
+    # moment some other row in this same clear still points at it.
+    ordered = order_for_clear(tables, provider.ref_columns()) if len(tables) > 1 else sorted(tables)
 
-        console.print(f"About to clear all rows from: {', '.join(ordered)}")
-        if not yes and not typer.confirm("Proceed?", default=False):
-            console.print("[dim]Aborted — nothing cleared.[/dim]")
-            raise typer.Exit(code=1)
+    console.print(f"About to clear all rows from: {', '.join(ordered)}")
+    if not yes and not typer.confirm("Proceed?", default=False):
+        console.print("[dim]Aborted — nothing cleared.[/dim]")
+        raise typer.Exit(code=1)
 
-        await provider.open()
-        try:
-            for t in ordered:
-                count = await provider.clear(t)
-                console.print(f"  {t}: {count} row(s) cleared (recoverable via `arc psqldb trash`)")
-        finally:
-            await provider.close()
+    async def _do() -> None:
+        for t in ordered:
+            count = await arc.psqldb.clear(t)
+            console.print(f"  {t}: {count} row(s) cleared (recoverable via `arc psqldb trash`)")
 
     with _friendly_errors():
-        asyncio.run(_run())
+        arc.runtime.run_async(_do(), open=("psqldb",))
     console.print("[bold green]Clear complete.[/bold green]")
 
 

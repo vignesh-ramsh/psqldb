@@ -34,10 +34,13 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass, field as dc_field
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from pathlib import Path
 
+from . import schema_spec
 from .fields import Field, FieldError, parse_field
+from .schema_spec import CodecError
 
 _SLUG_RE = re.compile(r"[^a-z0-9_]+")
 POSTGRES_IDENTIFIER_LIMIT = 63  # NAMEDATALEN - 1; Postgres silently truncates past this
@@ -214,6 +217,16 @@ def load_schema_file(path: Path, *, plugin: str) -> TableSchema:
     if not isinstance(raw, dict):
         raise SchemaError(f"{path}: schema file must be a JSON object.")
 
+    # Fast structural pre-check (psqldb.schema_spec) — a typo'd key, a wrong
+    # JSON type, or an unknown field `type` name fails HERE with one clear
+    # message, before any of the field-by-field parsing below even starts.
+    # Business rules (unique field required, primary_key is UUID-only, ...)
+    # are unaffected — those still run below, exactly as before.
+    try:
+        schema_spec.validate_schema_dict(raw)
+    except CodecError as exc:
+        raise SchemaError(f"{path}: {exc}") from exc
+
     system = bool(raw.get("system", False))
     audit = bool(raw.get("audit", False))
     child = bool(raw.get("child", False))
@@ -301,6 +314,11 @@ def load_patch_file(path: Path, *, plugin: str) -> TableSchema:
         raise SchemaError(f"{path}: not valid JSON ({exc}).") from exc
     if not isinstance(raw, dict):
         raise SchemaError(f"{path}: patch file must be a JSON object.")
+
+    try:
+        schema_spec.validate_patch_dict(raw)
+    except CodecError as exc:
+        raise SchemaError(f"{path}: {exc}") from exc
 
     table = slugify_table_name(path.stem, system=True)  # permissive: a patch never creates a
     # table, only resolves to whatever a schema already created — see slugify_table_name's docstring
