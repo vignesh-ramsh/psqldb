@@ -93,37 +93,38 @@ class Field:
     is indistinguishable from dropping one field and adding another, on
     purpose — that's the escape hatch for "this really is a different field".
     """
+
     id: str
     name: str
     type: str
     required: bool = False
     unique: bool = False
     primary_key: bool = False  # UUID only (enforced in parse_field below); only valid
-                                # on a "system": true schema (enforced in psqldb.model,
-                                # which is where "exactly one per schema" is checked too
-                                # — needs every field at once, not just this one).
+    # on a "system": true schema (enforced in psqldb.model,
+    # which is where "exactly one per schema" is checked too
+    # — needs every field at once, not just this one).
     length: int | None = None
     precision: int | None = None
     scale: int | None = None
     default: Any = None
     options: tuple[str, ...] | None = None  # SELECT only — a fixed choice list
     list: bool = True  # UI-only (admin's Data Browser table/list view, docs/
-                        # admin-ui-ux-review.md #4) — NOT a DDL/storage concern,
-                        # psqldb.ddl never reads this. Default True so every
-                        # already-authored schema keeps showing every column
-                        # unless a plugin explicitly opts a field OUT (e.g. a
-                        # verbose JSON/MULTIFILE blob that's fine in the row
-                        # editor but clutters a table view of many rows).
-    target: str | None = None      # REFERENCE / TABLE only — table this points to
+    # admin-ui-ux-review.md #4) — NOT a DDL/storage concern,
+    # psqldb.ddl never reads this. Default True so every
+    # already-authored schema keeps showing every column
+    # unless a plugin explicitly opts a field OUT (e.g. a
+    # verbose JSON/MULTIFILE blob that's fine in the row
+    # editor but clutters a table view of many rows).
+    target: str | None = None  # REFERENCE / TABLE only — table this points to
     target_field: str | None = None  # REFERENCE only — which field on `target` this
-                                      # points at. None = the implicit PK ("id") — the
-                                      # only option TABLE fields ever have. When set,
-                                      # this field's REAL physical column type is the
-                                      # TARGET field's type, not the plain "UUID" this
-                                      # class's own sql_type() below always returns for
-                                      # REFERENCE — that resolution needs every plugin's
-                                      # schemas at once, so it can't happen on a single
-                                      # Field in isolation; see psqldb.migrate.resolve_ref_columns.
+    # points at. None = the implicit PK ("id") — the
+    # only option TABLE fields ever have. When set,
+    # this field's REAL physical column type is the
+    # TARGET field's type, not the plain "UUID" this
+    # class's own sql_type() below always returns for
+    # REFERENCE — that resolution needs every plugin's
+    # schemas at once, so it can't happen on a single
+    # Field in isolation; see psqldb.migrate.resolve_ref_columns.
 
     def is_column(self) -> bool:
         """False only for TABLE — it generates a child table, not a column
@@ -163,7 +164,9 @@ def parse_field(raw: dict, *, table: str, index: int) -> Field:
 
     field_id = raw.get("id")
     if not field_id or not isinstance(field_id, str):
-        raise FieldError(f"{where}: missing required string key 'id' (a stable field identity, e.g. \"AA01\").")
+        raise FieldError(
+            f"{where}: missing required string key 'id' (a stable field identity, e.g. \"AA01\")."
+        )
     name = raw.get("name")
     if not name or not isinstance(name, str):
         raise FieldError(f"{where} ('{field_id}'): missing required string key 'name'.")
@@ -188,13 +191,21 @@ def parse_field(raw: dict, *, table: str, index: int) -> Field:
     if ftype == "DECIMAL" and precision is None:
         raise FieldError(f"{where}: type DECIMAL requires 'precision'.")
     if ftype == "SELECT":
-        if not isinstance(options, list) or not options or not all(isinstance(o, str) and o for o in options):
-            raise FieldError(f"{where}: type SELECT requires 'options' as a non-empty JSON array of strings.")
+        if (
+            not isinstance(options, list)
+            or not options
+            or not all(isinstance(o, str) and o for o in options)
+        ):
+            raise FieldError(
+                f"{where}: type SELECT requires 'options' as a non-empty JSON array of strings."
+            )
         options = tuple(options)
     elif options is not None:
         raise FieldError(f"{where}: 'options' is only valid for type SELECT.")
     if ftype in RELATIONAL_TYPES and not target:
-        raise FieldError(f"{where}: type {ftype} requires 'target' (the table/child-schema it points to).")
+        raise FieldError(
+            f"{where}: type {ftype} requires 'target' (the table/child-schema it points to)."
+        )
     if target_field is not None:
         if ftype != "REFERENCE":
             raise FieldError(
@@ -206,12 +217,22 @@ def parse_field(raw: dict, *, table: str, index: int) -> Field:
         target_field = target_field.strip()
         if target_field == "id":
             target_field = None  # "id" IS the default — normalize away the redundancy
-                                  # so every other file only ever has to handle one case
-                                  # ("None means id"), not two spellings of it.
+            # so every other file only ever has to handle one case
+            # ("None means id"), not two spellings of it.
 
     return Field(
-        id=field_id, name=name, type=ftype, required=required, unique=unique,
-        primary_key=primary_key, length=length, precision=precision, scale=scale,
-        default=default, options=options, target=target, target_field=target_field,
+        id=field_id,
+        name=name,
+        type=ftype,
+        required=required,
+        unique=unique,
+        primary_key=primary_key,
+        length=length,
+        precision=precision,
+        scale=scale,
+        default=default,
+        options=options,
+        target=target,
+        target_field=target_field,
         list=list_in_view,
     )

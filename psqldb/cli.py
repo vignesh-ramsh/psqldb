@@ -79,8 +79,7 @@ def status() -> None:
         version, elapsed = asyncio.run(_check())
     except Exception as exc:
         err_console.print(
-            f"psqldb: FAILED to connect to "
-            f"{parsed.hostname}:{parsed.port or 5432} — {exc}"
+            f"psqldb: FAILED to connect to {parsed.hostname}:{parsed.port or 5432} — {exc}"
         )
         raise typer.Exit(code=1)
 
@@ -105,10 +104,14 @@ def connect() -> None:
     dbname = parsed.path.lstrip("/") or parsed.username or "postgres"
     argv = [
         "psql",
-        "-h", parsed.hostname or "localhost",
-        "-p", str(parsed.port or 5432),
-        "-U", parsed.username or "postgres",
-        "-d", dbname,
+        "-h",
+        parsed.hostname or "localhost",
+        "-p",
+        str(parsed.port or 5432),
+        "-U",
+        parsed.username or "postgres",
+        "-d",
+        dbname,
     ]
 
     env = os.environ.copy()
@@ -153,7 +156,9 @@ def _friendly_errors():
 def _root_or_exit() -> Path:
     root = find_project_root()
     if root is None:
-        err_console.print("Not inside an ARC project (no .arc/arc.toml found here or in any parent).")
+        err_console.print(
+            "Not inside an ARC project (no .arc/arc.toml found here or in any parent)."
+        )
         raise typer.Exit(code=1)
     return root
 
@@ -163,9 +168,7 @@ def _build_plan(plugin: str | None, table: str | None) -> migrate.MigrationPlan:
     # but no live connection — done up front, sync, so a typo'd -p exits
     # before arc.runtime.run_async ever opens a pool for it.
     provider = _boot()
-    if plugin and not any(
-        s.plugin == plugin for s in [*provider.schemas(), *provider.patches()]
-    ):
+    if plugin and not any(s.plugin == plugin for s in [*provider.schemas(), *provider.patches()]):
         err_console.print(f"No schemas or patches registered for plugin '{plugin}'.")
         raise typer.Exit(code=1)
 
@@ -174,7 +177,9 @@ def _build_plan(plugin: str | None, table: str | None) -> migrate.MigrationPlan:
             # Always diff the FULL schema set (a -p scope must not make other
             # plugins' tables look "no longer declared" to _dropped_table_ops),
             # then narrow both ops AND schemas to the scope — see _scope_plan.
-            the_plan = await migrate.build_plan(conn, arc.psqldb.schemas(), arc.psqldb.patches(), only_table=table)
+            the_plan = await migrate.build_plan(
+                conn, arc.psqldb.schemas(), arc.psqldb.patches(), only_table=table
+            )
             if plugin:
                 _scope_plan(the_plan, plugin)
             return the_plan
@@ -196,7 +201,9 @@ def _scope_plan(plan: migrate.MigrationPlan, plugin: str) -> None:
 
 def _print_plan(plan: migrate.MigrationPlan) -> None:
     if plan.is_empty():
-        console.print("[dim]No schema changes — the live database already matches every registered schema/patch.[/dim]")
+        console.print(
+            "[dim]No schema changes — the live database already matches every registered schema/patch.[/dim]"
+        )
     else:
         for table, ops in plan.by_table().items():
             console.print(f"[bold]{table}[/bold]")
@@ -214,7 +221,8 @@ SCHEMA_DIR_NAME = "schema"  # under .arc/ — where the generated local JSON Sch
 @app.command()
 def check(
     write_schema: bool = typer.Option(
-        False, "--write-schema",
+        False,
+        "--write-schema",
         help="Also (re)write the local JSON Schema files under .arc/schema/ and wire "
         ".vscode/settings.json to point every schemas/*.json and patches/*.json file at "
         "them, for editor autocomplete. Safe to re-run any time schema_spec.py changes.",
@@ -255,7 +263,9 @@ def check(
         _write_local_schemas(root)
 
     if problems:
-        err_console.print(f"[bold red]{len(problems)} plugin(s) with problems[/bold red] (checked {total} file(s) OK elsewhere):")
+        err_console.print(
+            f"[bold red]{len(problems)} plugin(s) with problems[/bold red] (checked {total} file(s) OK elsewhere):"
+        )
         for plugin_name, message in problems:
             err_console.print(f"  [bold]{plugin_name}[/bold]: {message}")
         raise typer.Exit(code=1)
@@ -316,7 +326,9 @@ def _write_local_schemas(root: Path) -> None:
 
 @app.command()
 def plan(
-    plugin: str = typer.Option(None, "-p", "--plugin", help="Only show changes for this plugin's schemas/patches."),
+    plugin: str = typer.Option(
+        None, "-p", "--plugin", help="Only show changes for this plugin's schemas/patches."
+    ),
     table: str = typer.Option(None, "-t", "--table", help="Only show changes for this table."),
 ) -> None:
     """Preview what `arc psqldb migrate` would do — never touches the database."""
@@ -328,9 +340,13 @@ def plan(
 
 @app.command()
 def migrate_(
-    plugin: str = typer.Option(None, "-p", "--plugin", help="Only migrate this plugin's schemas/patches."),
+    plugin: str = typer.Option(
+        None, "-p", "--plugin", help="Only migrate this plugin's schemas/patches."
+    ),
     table: str = typer.Option(None, "-t", "--table", help="Only migrate this table."),
-    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt (for CI/non-interactive use)."),
+    yes: bool = typer.Option(
+        False, "--yes", "-y", help="Skip the confirmation prompt (for CI/non-interactive use)."
+    ),
 ) -> None:
     """Diff every registered schema AND patch against the live DB, show the
     plan, and — after confirmation — apply it. Always shows the plan first,
@@ -344,20 +360,28 @@ def migrate_(
         # return separately.
         provider = arc.psqldb
         schemas, patches = provider.schemas(), provider.patches()
-        target_plugins = {s.plugin for s in schemas if not plugin or s.plugin == plugin} | \
-                          {p.plugin for p in patches if not plugin or p.plugin == plugin}
+        target_plugins = {s.plugin for s in schemas if not plugin or s.plugin == plugin} | {
+            p.plugin for p in patches if not plugin or p.plugin == plugin
+        }
         reference = migrate.migration_reference()
         async with provider.acquire() as conn:
-            the_plan = await migrate.build_plan(conn, schemas, patches, only_table=table)
-            if plugin:
-                _scope_plan(the_plan, plugin)  # ops AND schemas — see _scope_plan
-            _print_plan(the_plan)
-            if the_plan.is_empty():
-                return
-            if not yes and not typer.confirm("Proceed?", default=False):
-                console.print("[dim]Aborted — nothing applied.[/dim]")
-                raise typer.Exit(code=1)
-            await migrate.apply_plan(conn, the_plan, reference=reference)
+            # Held for the WHOLE diff-then-apply window, not just apply_plan
+            # — two replicas racing must not both diff against the same
+            # "before" state and then both try to apply overlapping DDL.
+            # Blocks (with one logged notice, not a spinner-less hang) rather
+            # than failing outright; see migration_lock's own docstring for
+            # why this is safe to hold across the interactive confirm below.
+            async with migrate.migration_lock(conn):
+                the_plan = await migrate.build_plan(conn, schemas, patches, only_table=table)
+                if plugin:
+                    _scope_plan(the_plan, plugin)  # ops AND schemas — see _scope_plan
+                _print_plan(the_plan)
+                if the_plan.is_empty():
+                    return
+                if not yes and not typer.confirm("Proceed?", default=False):
+                    console.print("[dim]Aborted — nothing applied.[/dim]")
+                    raise typer.Exit(code=1)
+                await migrate.apply_plan(conn, the_plan, reference=reference)
         for plugin_name in sorted(target_plugins):
             plugin_ops_plan = migrate.MigrationPlan(
                 ops=[op for op in the_plan.ops if op.plugin == plugin_name]
@@ -410,7 +434,9 @@ def history(
         console.print("[dim]No history recorded yet — run `arc psqldb migrate`.[/dim]")
         return
     for r in rows:
-        console.print(f"{r['applied_at']}  {r['plugin']:<16} {r['table']:<20} {r['kind']:<6} {r['reference']}")
+        console.print(
+            f"{r['applied_at']}  {r['plugin']:<16} {r['table']:<20} {r['kind']:<6} {r['reference']}"
+        )
 
 
 @app.command()
@@ -468,7 +494,9 @@ def clear(
 def backup(
     plugin: str = typer.Option(None, "-p", "--plugin", help="Only back up this plugin's tables."),
     table: str = typer.Option(None, "-t", "--table", help="Only back up this one table."),
-    out: Path = typer.Option(None, "--out", help="Output file. Defaults to backups/db/<timestamp>.dump."),
+    out: Path = typer.Option(
+        None, "--out", help="Output file. Defaults to backups/db/<timestamp>.dump."
+    ),
 ) -> None:
     """pg_dump the database (or a subset of it) into backups/db/."""
     root = _root_or_exit()
@@ -479,6 +507,7 @@ def backup(
     dsn = _dsn()
     if out is None:
         import datetime as dt
+
         ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
         out = root / "backups" / "db" / f"{ts}.dump"
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -502,7 +531,9 @@ def restore(
     """pg_restore a dump produced by `arc psqldb backup`."""
     root = _root_or_exit()
     if shutil.which("pg_restore") is None:
-        err_console.print("`pg_restore` was not found on PATH. Install the PostgreSQL client tools.")
+        err_console.print(
+            "`pg_restore` was not found on PATH. Install the PostgreSQL client tools."
+        )
         raise typer.Exit(code=1)
     if not dump_file.exists():
         err_console.print(f"{dump_file} does not exist.")
@@ -540,7 +571,9 @@ def trash_list(table: str = typer.Option(None, "-t", "--table")) -> None:
     async def _run():
         conn = await asyncpg.connect(dsn)
         try:
-            query = 'SELECT id, "table", drop_type, deleted_at FROM _trash WHERE restored_at IS NULL'
+            query = (
+                'SELECT id, "table", drop_type, deleted_at FROM _trash WHERE restored_at IS NULL'
+            )
             params = []
             if table:
                 query += ' AND "table" = $1'
@@ -559,7 +592,11 @@ def trash_list(table: str = typer.Option(None, "-t", "--table")) -> None:
 
 
 @trash_app.command(name="recover")
-def trash_recover(trash_id: str = typer.Argument(..., help="The _trash row's own id (not the original document's).")) -> None:
+def trash_recover(
+    trash_id: str = typer.Argument(
+        ..., help="The _trash row's own id (not the original document's)."
+    ),
+) -> None:
     """Recover a _trash entry: Row/Table entries are re-inserted as-is;
     Column entries update just that one column back onto its original row."""
     dsn = _dsn()
@@ -572,12 +609,17 @@ def trash_recover(trash_id: str = typer.Argument(..., help="The _trash row's own
                 err_console.print(f"No _trash entry with id '{trash_id}'.")
                 raise typer.Exit(code=1)
             if row["restored_at"] is not None:
-                err_console.print(f"_trash entry '{trash_id}' was already restored at {row['restored_at']}.")
+                err_console.print(
+                    f"_trash entry '{trash_id}' was already restored at {row['restored_at']}."
+                )
                 raise typer.Exit(code=1)
 
             import json
+
             raw_snapshot = row["snapshot"]
-            snapshot_text = raw_snapshot if isinstance(raw_snapshot, str) else json.dumps(raw_snapshot)
+            snapshot_text = (
+                raw_snapshot if isinstance(raw_snapshot, str) else json.dumps(raw_snapshot)
+            )
             table = row["table"]
 
             # jsonb_populate_record does server-side, per-column type
@@ -589,7 +631,7 @@ def trash_recover(trash_id: str = typer.Argument(..., help="The _trash row's own
                 await conn.execute(
                     f'INSERT INTO "{table}" '
                     f'SELECT * FROM jsonb_populate_record(null::"{table}", $1::jsonb) '
-                    f'ON CONFLICT (id) DO NOTHING',
+                    f"ON CONFLICT (id) DO NOTHING",
                     snapshot_text,
                 )
             else:  # Column
@@ -599,8 +641,9 @@ def trash_recover(trash_id: str = typer.Argument(..., help="The _trash row's own
                 await conn.execute(
                     f'UPDATE "{table}" t SET "{col}" = x."{col}" '
                     f'FROM jsonb_populate_record(null::"{table}", $1::jsonb) AS x '
-                    f'WHERE t.id = $2',
-                    snapshot_text, row_id,
+                    f"WHERE t.id = $2",
+                    snapshot_text,
+                    row_id,
                 )
 
             await conn.execute("UPDATE _trash SET restored_at = now() WHERE id = $1", trash_id)

@@ -20,6 +20,7 @@ Gateway/arc.health design, not to this plugin.
 from __future__ import annotations
 
 import contextlib
+import logging
 from pathlib import Path
 from typing import Any, Callable
 from uuid import UUID
@@ -44,6 +45,10 @@ CAPABILITY = "psqldb"
 DSN_KEY = "psqldb_dsn"
 POOL_MIN_SIZE_KEY = "psqldb_pool_min_size"
 POOL_MAX_SIZE_KEY = "psqldb_pool_max_size"
+SLOW_QUERY_THRESHOLD_MS_KEY = "psqldb_slow_query_threshold_ms"
+STATEMENT_TIMEOUT_MS_KEY = "psqldb_statement_timeout_ms"
+
+_logger = logging.getLogger("psqldb")
 
 # Only the fields the DB (or the CRUD helpers themselves) always supplies a
 # correct value for get silently stripped from a caller's insert()/update()
@@ -51,7 +56,23 @@ POOL_MAX_SIZE_KEY = "psqldb_pool_max_size"
 # table gets them automatically), but neither has a value the database can
 # invent on its own — `parent` is required with no default (which row this
 # child belongs to) — so both must stay caller-settable.
-_SYSTEM_COLUMN_NAMES = frozenset({"id", "created_at", "updated_at", "created_by", "updated_by", "_state"})
+_SYSTEM_COLUMN_NAMES = frozenset(
+    {"id", "created_at", "updated_at", "created_by", "updated_by", "_state"}
+)
+
+
+def _as_dict(record: asyncpg.Record | None) -> dict | None:
+    """asyncpg.Record is read-only and doesn't compare equal to a dict with
+    the same contents — every consumer of a psqldb row used to have to know
+    to `dict(row)` it themselves before it behaved like a normal Python
+    value (relay's own code already did this at every call site). Converting
+    HERE, once, at the source, makes psqldb's own CRUD primitives return the
+    same plain-dict shape relay's public API already promises."""
+    return dict(record) if record is not None else None
+
+
+def _as_dicts(records: list[asyncpg.Record]) -> list[dict]:
+    return [dict(r) for r in records]
 
 
 class PsqlDbProvider:
@@ -60,11 +81,24 @@ class PsqlDbProvider:
     Relay's future bounded query engine will build on top of — see
     docs/arc.MD §3.4. Deliberately not a query builder or an ORM."""
 
-    def __init__(self, kernel: Any, dsn: str, min_size: int = 1, max_size: int = 10) -> None:
+    def __init__(
+        self,
+        kernel: Any,
+        dsn: str,
+        min_size: int = 1,
+        max_size: int = 10,
+        *,
+        slow_query_threshold_ms: int = 0,
+        statement_timeout_ms: int = 30_000,
+    ) -> None:
         self._kernel = kernel
         self.dsn = dsn
         self.min_size = min_size
         self.max_size = max_size
+        # 0 disables each — a deliberate, explicit opt-out, not a magic
+        # sentinel someone has to already know about.
+        self.slow_query_threshold_ms = slow_query_threshold_ms
+        self.statement_timeout_ms = statement_timeout_ms
         self._pool: asyncpg.Pool | None = None
         self._schemas: list[TableSchema] = []
         self._by_table: dict[str, TableSchema] = {}
@@ -222,7 +256,9 @@ class PsqlDbProvider:
         # any subscriber's outcome.
         import asyncio as _asyncio
 
-        with contextlib.suppress(RuntimeError):  # no running loop (sync/test caller) — event skipped
+        with contextlib.suppress(
+            RuntimeError
+        ):  # no running loop (sync/test caller) — event skipped
             _asyncio.get_running_loop()
             _asyncio.ensure_future(
                 arc.events.emit("psqldb.schema.changed", table=schema.table, plugin=plugin)
@@ -321,6 +357,7 @@ class PsqlDbProvider:
             for f in patch_fields:
                 merged[f.id] = f
             from dataclasses import replace
+
             result = replace(base, fields=list(merged.values()))
         self._schema_cache[table] = result
         return result
@@ -362,7 +399,16 @@ class PsqlDbProvider:
         but converts to/from that instant using the SESSION's timezone on
         every read and write — so setting it once per connection, here,
         is the one place this needs to happen; nothing downstream (relay,
-        the Query Engine, a business plugin) has to do its own UTC math."""
+        the Query Engine, a business plugin) has to do its own UTC math.
+
+        Also applies `statement_timeout` (psqldb_statement_timeout_ms,
+        default 30s) so one runaway query can't hold a connection (and
+        whatever locks it's taken) forever, and — if
+        psqldb_slow_query_threshold_ms is set above 0 — registers a slow-
+        query logger via asyncpg's own `add_query_logger` (its official
+        instrumentation hook, not a hand-rolled wrapper around every CRUD
+        method), so every query through this pool is measured the same
+        way regardless of which helper it came through."""
 
         def _encode_json(value: Any) -> str:
             return arc.codec.encode(value).decode()
@@ -374,17 +420,42 @@ class PsqlDbProvider:
             await conn.set_type_codec(
                 "json", encoder=_encode_json, decoder=arc.codec.decode, schema="pg_catalog"
             )
-            # set_config (not a raw `SET TIME ZONE '<value>'` string) so the
-            # configured zone name is a real bound parameter, never
-            # interpolated into SQL text.
+            # set_config (not a raw `SET ... = '<value>'` string) for both
+            # of these so the configured value is always a real bound
+            # parameter, never interpolated into SQL text.
             await conn.execute(
                 "SELECT set_config('TimeZone', $1, false)", str(arc.tz.server_timezone())
             )
+            if self.statement_timeout_ms > 0:
+                await conn.execute(
+                    "SELECT set_config('statement_timeout', $1, false)",
+                    str(self.statement_timeout_ms),
+                )
+            if self.slow_query_threshold_ms > 0:
+                conn.add_query_logger(self._log_slow_query)
 
         if self._pool is None:
             self._pool = await asyncpg.create_pool(
                 self.dsn, min_size=self.min_size, max_size=self.max_size, init=_init_connection
             )
+
+    def _log_slow_query(self, record: Any) -> None:
+        """asyncpg's add_query_logger callback — `record` carries `.query`,
+        `.args`, `.elapsed` (seconds), `.exception` (see asyncpg's own
+        LoggedQuery). Fires for every query on this connection; the
+        threshold check happens here rather than by only registering the
+        logger conditionally per-query, since asyncpg has no cheaper way to
+        scope it and this check itself costs nothing."""
+        elapsed_ms = record.elapsed * 1000
+        if elapsed_ms < self.slow_query_threshold_ms:
+            return
+        query = record.query if len(record.query) <= 500 else record.query[:500] + "…"
+        _logger.warning(
+            "slow query (%.1fms >= %dms threshold): %s",
+            elapsed_ms,
+            self.slow_query_threshold_ms,
+            query,
+        )
 
     async def close(self) -> None:
         if self._pool is not None:
@@ -404,13 +475,13 @@ class PsqlDbProvider:
         async with self.acquire() as conn:
             return await conn.execute(query, *params)
 
-    async def fetch(self, query: str, *params: Any) -> list[asyncpg.Record]:
+    async def fetch(self, query: str, *params: Any) -> list[dict]:
         async with self.acquire() as conn:
-            return await conn.fetch(query, *params)
+            return _as_dicts(await conn.fetch(query, *params))
 
-    async def fetch_one(self, query: str, *params: Any) -> asyncpg.Record | None:
+    async def fetch_one(self, query: str, *params: Any) -> dict | None:
         async with self.acquire() as conn:
-            return await conn.fetchrow(query, *params)
+            return _as_dict(await conn.fetchrow(query, *params))
 
     async def fetch_val(self, query: str, *params: Any) -> Any:
         async with self.acquire() as conn:
@@ -419,9 +490,30 @@ class PsqlDbProvider:
     async def health(self) -> dict:
         try:
             version = await self.fetch_val("select version()")
-            return {"ok": True, "version": version}
+            return {"ok": True, "version": version, "pool": self.pool_stats()}
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            return {"ok": False, "error": str(exc), "pool": self.pool_stats()}
+
+    def pool_stats(self) -> dict:
+        """Real pool saturation numbers — size/idle/min/max — or all-zero
+        with `open` false if the pool hasn't been opened at all (never
+        raises; a caller checking "is this saturated" shouldn't have to
+        also handle "was it ever opened" separately)."""
+        if self._pool is None:
+            return {
+                "open": False,
+                "size": 0,
+                "idle": 0,
+                "min_size": self.min_size,
+                "max_size": self.max_size,
+            }
+        return {
+            "open": True,
+            "size": self._pool.get_size(),
+            "idle": self._pool.get_idle_size(),
+            "min_size": self._pool.get_min_size(),
+            "max_size": self._pool.get_max_size(),
+        }
 
     @contextlib.asynccontextmanager
     async def _conn_or(self, conn: Any):
@@ -441,7 +533,9 @@ class PsqlDbProvider:
     # Relay's future engine wraps these with hooks/RBAC/query bounds; it
     # doesn't reinvent field validation or the soft-delete contract below.
     # ------------------------------------------------------------------ #
-    async def insert(self, table: str, data: dict[str, Any], *, created_by: str | None = None, conn: Any = None) -> asyncpg.Record:
+    async def insert(
+        self, table: str, data: dict[str, Any], *, created_by: str | None = None, conn: Any = None
+    ) -> dict:
         schema = self.schema(table)
         clean = {k: v for k, v in data.items() if k not in _SYSTEM_COLUMN_NAMES}
         validation.validate_row(schema, clean)
@@ -456,13 +550,21 @@ class PsqlDbProvider:
             col_list = ", ".join(f'"{c}"' for c in columns)
             query = f'INSERT INTO "{table}" ({col_list}) VALUES ({placeholders}) RETURNING *'
             try:
-                return await c.fetchrow(query, *(clean[col] for col in columns))
+                return _as_dict(await c.fetchrow(query, *(clean[col] for col in columns)))
             except asyncpg.ForeignKeyViolationError as exc:
                 raise validation.friendly_fk_error(exc, table=table) from exc
             except asyncpg.UniqueViolationError as exc:
                 raise validation.friendly_unique_error(exc, table=table) from exc
 
-    async def update(self, table: str, id: UUID, data: dict[str, Any], *, updated_by: str | None = None, conn: Any = None) -> asyncpg.Record | None:
+    async def update(
+        self,
+        table: str,
+        id: UUID,
+        data: dict[str, Any],
+        *,
+        updated_by: str | None = None,
+        conn: Any = None,
+    ) -> dict | None:
         schema = self.schema(table)
         clean = {k: v for k, v in data.items() if k not in _SYSTEM_COLUMN_NAMES}
         validation.validate_row(schema, clean)
@@ -480,17 +582,19 @@ class PsqlDbProvider:
                 # carries the match_on fields). A clean no-op returning the
                 # current row keeps save()'s "returns the persisted row"
                 # contract intact.
-                return await c.fetchrow(f'SELECT * FROM "{table}" WHERE id = $1', id)
+                return _as_dict(await c.fetchrow(f'SELECT * FROM "{table}" WHERE id = $1', id))
             set_clause = ", ".join(f'"{col}" = ${i + 2}' for i, col in enumerate(columns))
             query = f'UPDATE "{table}" SET {set_clause} WHERE id = $1 RETURNING *'
             try:
-                return await c.fetchrow(query, id, *(clean[col] for col in columns))
+                return _as_dict(await c.fetchrow(query, id, *(clean[col] for col in columns)))
             except asyncpg.ForeignKeyViolationError as exc:
                 raise validation.friendly_fk_error(exc, table=table) from exc
             except asyncpg.UniqueViolationError as exc:
                 raise validation.friendly_unique_error(exc, table=table) from exc
 
-    async def soft_delete(self, table: str, id: UUID, *, deleted_by: str | None = None, conn: Any = None) -> None:
+    async def soft_delete(
+        self, table: str, id: UUID, *, deleted_by: str | None = None, conn: Any = None
+    ) -> None:
         """Never a hard DELETE for a normal/child table — sets `_state = 99`.
         The DB-level arc_soft_delete_to_trash trigger (psqldb.ddl) takes it
         from there: snapshots the row into `_trash`, cascades to any child
@@ -511,7 +615,9 @@ class PsqlDbProvider:
                 await c.execute(f'DELETE FROM "{table}" WHERE id = $1', id)
             else:
                 await c.execute(
-                    f'UPDATE "{table}" SET _state = 99, updated_by = $2 WHERE id = $1', id, deleted_by
+                    f'UPDATE "{table}" SET _state = 99, updated_by = $2 WHERE id = $1',
+                    id,
+                    deleted_by,
                 )
 
     # ------------------------------------------------------------------ #
@@ -541,7 +647,14 @@ class PsqlDbProvider:
                 )
         return sorted(columns)
 
-    async def insert_many(self, table: str, rows: list[dict[str, Any]], *, created_by: str | None = None, conn: Any = None) -> list[asyncpg.Record]:
+    async def insert_many(
+        self,
+        table: str,
+        rows: list[dict[str, Any]],
+        *,
+        created_by: str | None = None,
+        conn: Any = None,
+    ) -> list[dict]:
         if not rows:
             return []
         schema = self.schema(table)
@@ -565,13 +678,20 @@ class PsqlDbProvider:
                 pi += len(columns)
             query = f'INSERT INTO "{table}" ({col_list}) VALUES {", ".join(value_rows)} RETURNING *'
             try:
-                return await c.fetch(query, *params)
+                return _as_dicts(await c.fetch(query, *params))
             except asyncpg.ForeignKeyViolationError as exc:
                 raise validation.friendly_fk_error(exc, table=table) from exc
             except asyncpg.UniqueViolationError as exc:
                 raise validation.friendly_unique_error(exc, table=table) from exc
 
-    async def update_many(self, table: str, updates: list[dict[str, Any]], *, updated_by: str | None = None, conn: Any = None) -> list[asyncpg.Record]:
+    async def update_many(
+        self,
+        table: str,
+        updates: list[dict[str, Any]],
+        *,
+        updated_by: str | None = None,
+        conn: Any = None,
+    ) -> list[dict]:
         """`updates` is `[{"id": ..., "data": {...}}, ...]` — every entry's
         `data` must update the same fields, same homogeneity rule as
         insert_many."""
@@ -616,8 +736,11 @@ class PsqlDbProvider:
             # go through the cross-schema-resolved type instead.
             ref_columns = self.ref_columns()
             field_types = {
-                f.name: (ref_columns[(table, f.name)].sql_type if f.type == "REFERENCE" else f.sql_type())
-                for f in schema.fields if f.is_column()
+                f.name: (
+                    ref_columns[(table, f.name)].sql_type if f.type == "REFERENCE" else f.sql_type()
+                )
+                for f in schema.fields
+                if f.is_column()
             }
             data_columns = ["_row_id", *columns]
             data_casts = ["uuid", *(field_types[col] for col in columns)]
@@ -627,23 +750,27 @@ class PsqlDbProvider:
             for row_id, clean in zip(ids, cleaned):
                 values = [row_id, *(clean[col] for col in columns)]
                 value_rows.append(
-                    "(" + ", ".join(f"${pi + j}::{data_casts[j]}" for j in range(len(data_columns))) + ")"
+                    "("
+                    + ", ".join(f"${pi + j}::{data_casts[j]}" for j in range(len(data_columns)))
+                    + ")"
                 )
                 params.extend(values)
                 pi += len(data_columns)
             query = (
                 f'UPDATE "{table}" SET {set_clause} '
-                f'FROM (VALUES {", ".join(value_rows)}) AS data({data_col_list}) '
+                f"FROM (VALUES {', '.join(value_rows)}) AS data({data_col_list}) "
                 f'WHERE "{table}".id = data._row_id RETURNING "{table}".*'
             )
             try:
-                return await c.fetch(query, *params)
+                return _as_dicts(await c.fetch(query, *params))
             except asyncpg.ForeignKeyViolationError as exc:
                 raise validation.friendly_fk_error(exc, table=table) from exc
             except asyncpg.UniqueViolationError as exc:
                 raise validation.friendly_unique_error(exc, table=table) from exc
 
-    async def soft_delete_many(self, table: str, ids: list[UUID], *, deleted_by: str | None = None, conn: Any = None) -> None:
+    async def soft_delete_many(
+        self, table: str, ids: list[UUID], *, deleted_by: str | None = None, conn: Any = None
+    ) -> None:
         if not ids:
             return
         schema = self.schema(table)
@@ -653,15 +780,18 @@ class PsqlDbProvider:
             else:
                 await c.execute(
                     f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE id = ANY($2::uuid[])',
-                    deleted_by, ids,
+                    deleted_by,
+                    ids,
                 )
 
-    async def get_many(self, table: str, ids: list[UUID], *, conn: Any = None) -> list[asyncpg.Record]:
+    async def get_many(self, table: str, ids: list[UUID], *, conn: Any = None) -> list[dict]:
         self.schema(table)
         if not ids:
             return []
         async with self._conn_or(conn) as c:
-            return await c.fetch(f'SELECT * FROM "{table}" WHERE id = ANY($1::uuid[])', ids)
+            return _as_dicts(
+                await c.fetch(f'SELECT * FROM "{table}" WHERE id = ANY($1::uuid[])', ids)
+            )
 
     async def clear(self, table: str, *, cleared_by: str | None = None) -> int:
         """`arc psqldb clear` — every row in `table` goes through the same
@@ -705,7 +835,9 @@ class PsqlDbProvider:
     # Both are refused by default; `force=True` overrides both — dropping
     # the table anyway (patch case) or retrying with CASCADE (FK case).
     # ------------------------------------------------------------------ #
-    async def wipe_plugin_tables(self, plugin: str, *, force: bool = False, dry_run: bool = False) -> dict:
+    async def wipe_plugin_tables(
+        self, plugin: str, *, force: bool = False, dry_run: bool = False
+    ) -> dict:
         """Returns {"tables": [...ordered...], "audit_table": str | None,
         "row_counts": {table: int}}. `row_counts` is always computed (even
         on a real, non-dry-run call) so the caller can show what was about
@@ -721,17 +853,24 @@ class PsqlDbProvider:
             foreign = await self.fetch(
                 'SELECT DISTINCT "table", plugin FROM _field_registry '
                 'WHERE "table" = ANY($1) AND plugin != $2',
-                list(tables), plugin,
+                list(tables),
+                plugin,
             )
             if foreign:
-                detail = ", ".join(f"'{r['table']}' (has fields owned by '{r['plugin']}')" for r in foreign)
+                detail = ", ".join(
+                    f"'{r['table']}' (has fields owned by '{r['plugin']}')" for r in foreign
+                )
                 raise migrate.MigrationError(
                     f"cannot wipe '{plugin}': {detail} — another plugin has patched fields onto "
                     f"a table '{plugin}' owns; dropping it would destroy that plugin's columns "
                     f"and data too. Pass force=True to do it anyway."
                 )
 
-        ordered = migrate.order_for_clear(tables, self.ref_columns()) if len(tables) > 1 else sorted(tables)
+        ordered = (
+            migrate.order_for_clear(tables, self.ref_columns())
+            if len(tables) > 1
+            else sorted(tables)
+        )
 
         audit_table = f"_audit_{plugin}"
         exists = await self.fetch_val(
@@ -770,10 +909,10 @@ class PsqlDbProvider:
                 ) from exc
             await self.execute(f'DROP TABLE "{table}" CASCADE')
 
-    async def get(self, table: str, id: UUID, *, conn: Any = None) -> asyncpg.Record | None:
+    async def get(self, table: str, id: UUID, *, conn: Any = None) -> dict | None:
         self.schema(table)
         async with self._conn_or(conn) as c:
-            return await c.fetchrow(f'SELECT * FROM "{table}" WHERE id = $1', id)
+            return _as_dict(await c.fetchrow(f'SELECT * FROM "{table}" WHERE id = $1', id))
 
     # get_by() is gone (docs/arc.MD §3.11): it was a narrow single-field-
     # equality stopgap superseded by arc.relay.get(table, {field: value}),
@@ -799,6 +938,18 @@ def register(kernel: Any) -> None:
         default=10,
         doc="Maximum size of the asyncpg connection pool.",
     )
+    kernel.settings.declare(
+        SLOW_QUERY_THRESHOLD_MS_KEY,
+        type=int,
+        default=0,
+        doc="Log a warning for any query slower than this many milliseconds. 0 disables slow-query logging.",
+    )
+    kernel.settings.declare(
+        STATEMENT_TIMEOUT_MS_KEY,
+        type=int,
+        default=30_000,
+        doc="Postgres statement_timeout applied to every pooled connection, in milliseconds. 0 disables it.",
+    )
 
     dsn = kernel.settings.get(DSN_KEY, reveal=True)
     if dsn is None:
@@ -809,8 +960,17 @@ def register(kernel: Any) -> None:
 
     min_size = kernel.settings.get(POOL_MIN_SIZE_KEY)
     max_size = kernel.settings.get(POOL_MAX_SIZE_KEY)
+    slow_query_threshold_ms = kernel.settings.get(SLOW_QUERY_THRESHOLD_MS_KEY)
+    statement_timeout_ms = kernel.settings.get(STATEMENT_TIMEOUT_MS_KEY)
 
-    provider = PsqlDbProvider(kernel, dsn, min_size=min_size, max_size=max_size)
+    provider = PsqlDbProvider(
+        kernel,
+        dsn,
+        min_size=min_size,
+        max_size=max_size,
+        slow_query_threshold_ms=slow_query_threshold_ms,
+        statement_timeout_ms=statement_timeout_ms,
+    )
     kernel.export(CAPABILITY, provider, requires=[], optional_requires=[])
     # system.reload -> full re-scan of every registered schemas/patches
     # directory (see reconcile()'s own docstring). Subscribed here, inside

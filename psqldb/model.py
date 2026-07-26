@@ -54,7 +54,7 @@ _RESERVED_SYSTEM_TABLE_NAMES = frozenset({"_trash", "_field_registry", "_patch_h
 
 
 def slugify_table_name(filename_stem: str, *, system: bool = False) -> str:
-    """"Legal Tasks" -> "legal_tasks". Must produce a valid, boring Postgres
+    """ "Legal Tasks" -> "legal_tasks". Must produce a valid, boring Postgres
     identifier — collisions and invalid names are rejected loudly at plan/
     migrate time, never silently mangled further than this one deterministic
     rule.
@@ -119,7 +119,9 @@ NORMAL_SYSTEM_FIELDS = [
 
 CHILD_SYSTEM_FIELDS = [
     Field(id="_id", name="id", type="REFERENCE_PK"),
-    Field(id="_parent", name="parent", type="REFERENCE_UUID"),  # FK target filled in once the owning parent is known
+    Field(
+        id="_parent", name="parent", type="REFERENCE_UUID"
+    ),  # FK target filled in once the owning parent is known
     Field(id="_idx", name="idx", type="INT"),
     Field(id="_created_at", name="created_at", type="DATETIME"),
     Field(id="_updated_at", name="updated_at", type="DATETIME"),
@@ -136,19 +138,19 @@ CHILD_SYSTEM_FIELDS = [
 
 @dataclass(frozen=True)
 class TableSchema:
-    table: str                 # slugified physical table name
-    plugin: str                # owning plugin name (attributed by the caller, not this file)
+    table: str  # slugified physical table name
+    plugin: str  # owning plugin name (attributed by the caller, not this file)
     source_path: Path
-    system: bool               # self-declares every field (no auto-injection); also permits a `_`-prefixed table name
+    system: bool  # self-declares every field (no auto-injection); also permits a `_`-prefixed table name
     audit: bool
     child: bool
     fields: list[Field]
     indexes: list[dict]
     system_fields: list[Field]  # already resolved for this table (empty if system=True or is_patch)
-    is_patch: bool = False     # from plugins/<plugin>/patches/, not plugins/<plugin>/schemas/ —
-                                # see psqldb.migrate: never creates its table (skip+warn if missing),
-                                # diffed against ONLY the fields this same plugin already owns on that
-                                # table (never another plugin's, and never TABLE-typed/child fields)
+    is_patch: bool = False  # from plugins/<plugin>/patches/, not plugins/<plugin>/schemas/ —
+    # see psqldb.migrate: never creates its table (skip+warn if missing),
+    # diffed against ONLY the fields this same plugin already owns on that
+    # table (never another plugin's, and never TABLE-typed/child fields)
 
     def all_fields(self) -> list[Field]:
         return [*self.system_fields, *self.fields]
@@ -200,7 +202,9 @@ def _parse_fields_and_indexes(
         key = idx.get("key")
         idx_fields = idx.get("fields")
         if not key or not isinstance(idx_fields, list) or not idx_fields:
-            raise SchemaError(f"{path}: each 'index' entry needs a 'key' and a non-empty 'fields' list.")
+            raise SchemaError(
+                f"{path}: each 'index' entry needs a 'key' and a non-empty 'fields' list."
+            )
         unknown = [f for f in idx_fields if f not in known_columns]
         if unknown:
             raise SchemaError(f"{path}: index '{key}' references unknown field(s) {unknown}.")
@@ -235,7 +239,9 @@ def load_schema_file(path: Path, *, plugin: str) -> TableSchema:
     if system and child:
         raise SchemaError(f"{path}: 'system' and 'child' cannot both be true.")
 
-    system_fields = [] if system else (list(CHILD_SYSTEM_FIELDS) if child else list(NORMAL_SYSTEM_FIELDS))
+    system_fields = (
+        [] if system else (list(CHILD_SYSTEM_FIELDS) if child else list(NORMAL_SYSTEM_FIELDS))
+    )
     fields, indexes = _parse_fields_and_indexes(
         raw, path, table=table, known_system_columns={sf.name for sf in system_fields}
     )
@@ -253,7 +259,7 @@ def load_schema_file(path: Path, *, plugin: str) -> TableSchema:
             f"Every normal table needs at least one business-declared unique "
             f"field of its own — the framework's auto-generated 'id' doesn't "
             f"count. Mark whichever field is this table's natural key (e.g. "
-            f"an employee_code, an order number, a slug) as \"unique\": true."
+            f'an employee_code, an order number, a slug) as "unique": true.'
         )
 
     # A "system": true table gets no auto-injected id (system_fields is empty
@@ -265,7 +271,7 @@ def load_schema_file(path: Path, *, plugin: str) -> TableSchema:
     if system and len(pk_fields) != 1:
         raise SchemaError(
             f"{path}: system table '{table}' must declare exactly one field with "
-            f"\"primary_key\": true (found {len(pk_fields)}) — a system table "
+            f'"primary_key": true (found {len(pk_fields)}) — a system table '
             f"self-declares its own key since no id is auto-injected for it."
         )
     if not system and pk_fields:
@@ -276,8 +282,15 @@ def load_schema_file(path: Path, *, plugin: str) -> TableSchema:
         )
 
     return TableSchema(
-        table=table, plugin=plugin, source_path=path, system=system, audit=audit,
-        child=child, fields=fields, indexes=indexes, system_fields=system_fields,
+        table=table,
+        plugin=plugin,
+        source_path=path,
+        system=system,
+        audit=audit,
+        child=child,
+        fields=fields,
+        indexes=indexes,
+        system_fields=system_fields,
     )
 
 
@@ -328,12 +341,20 @@ def load_patch_file(path: Path, *, plugin: str) -> TableSchema:
         if f.type == "TABLE":
             raise SchemaError(
                 f"{path}: field '{f.name}' is type TABLE — patches cannot declare "
-                f"child tables (that requires \"child\": true in a schema, not a patch)."
+                f'child tables (that requires "child": true in a schema, not a patch).'
             )
 
     return TableSchema(
-        table=table, plugin=plugin, source_path=path, system=False, audit=False,
-        child=False, fields=fields, indexes=indexes, system_fields=[], is_patch=True,
+        table=table,
+        plugin=plugin,
+        source_path=path,
+        system=False,
+        audit=False,
+        child=False,
+        fields=fields,
+        indexes=indexes,
+        system_fields=[],
+        is_patch=True,
     )
 
 

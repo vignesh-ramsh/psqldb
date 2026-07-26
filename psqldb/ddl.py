@@ -31,9 +31,11 @@ class RefColumn:
     see Field.target_field). `column`/`sql_type` are "id"/"UUID" for the
     default case (no target_field declared) — same shape either way so
     callers here never need two code paths for "default" vs "custom" target."""
-    table: str       # physical target table
-    column: str       # physical target column ("id", or a declared unique field's name)
-    sql_type: str     # that column's own SQL type — the REFERENCING column must match it
+
+    table: str  # physical target table
+    column: str  # physical target column ("id", or a declared unique field's name)
+    sql_type: str  # that column's own SQL type — the REFERENCING column must match it
+
 
 # ------------------------------------------------------------------------ #
 # System fields don't go through Field.sql_type() (they use sentinel types
@@ -62,7 +64,9 @@ def _system_column_sql(f: Field, *, parent_table: str | None) -> str:
     raise AssertionError(f"unhandled system field id {f.id!r}")
 
 
-def _user_column_sql(f: Field, *, owner_table: str, ref_columns: dict[tuple[str, str], RefColumn]) -> str:
+def _user_column_sql(
+    f: Field, *, owner_table: str, ref_columns: dict[tuple[str, str], RefColumn]
+) -> str:
     if f.primary_key:
         # Same shape a normal table's auto-injected id gets (_system_column_sql's
         # "_id" branch above) — just self-declared, since a "system": true table
@@ -102,7 +106,9 @@ def _sql_literal(value) -> str:
 
 
 def create_table_sql(
-    schema: TableSchema, *, parent_table: str | None = None,
+    schema: TableSchema,
+    *,
+    parent_table: str | None = None,
     ref_columns: dict[tuple[str, str], RefColumn] | None = None,
 ) -> list[str]:
     """Returns the statements to create `schema` from nothing: the table,
@@ -121,9 +127,7 @@ def create_table_sql(
             columns.append(_user_column_sql(f, owner_table=schema.table, ref_columns=ref_columns))
 
     stmts = [
-        f'CREATE TABLE IF NOT EXISTS "{schema.table}" (\n    '
-        + ",\n    ".join(columns)
-        + "\n)"
+        f'CREATE TABLE IF NOT EXISTS "{schema.table}" (\n    ' + ",\n    ".join(columns) + "\n)"
     ]
     stmts += index_sql(schema)
     if not schema.system:
@@ -145,10 +149,10 @@ def trigger_attach_sql(table: str) -> list[str]:
     return [
         f'DROP TRIGGER IF EXISTS arc_set_updated_at ON "{table}"',
         f'CREATE TRIGGER arc_set_updated_at BEFORE UPDATE ON "{table}" '
-        f'FOR EACH ROW EXECUTE FUNCTION arc_set_updated_at()',
+        f"FOR EACH ROW EXECUTE FUNCTION arc_set_updated_at()",
         f'DROP TRIGGER IF EXISTS arc_soft_delete_to_trash ON "{table}"',
         f'CREATE TRIGGER arc_soft_delete_to_trash AFTER INSERT OR UPDATE ON "{table}" '
-        f'FOR EACH ROW EXECUTE FUNCTION arc_soft_delete_to_trash()',
+        f"FOR EACH ROW EXECUTE FUNCTION arc_soft_delete_to_trash()",
     ]
 
 
@@ -174,8 +178,7 @@ def trigger_attach_sql(table: str) -> list[str]:
 # COLUMN ref_field TEXT`).
 # ------------------------------------------------------------------------ #
 BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
-    'CREATE EXTENSION IF NOT EXISTS pgcrypto',
-
+    "CREATE EXTENSION IF NOT EXISTS pgcrypto",
     # -- _patch_history: durable per-table audit log of every applied schema
     # change, from either source — a generated schema-diff migration file
     # (kind='schema') or an explicit patches/<table>.json (kind='patch').
@@ -191,7 +194,6 @@ BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
         PRIMARY KEY (plugin, "table", kind, reference)
     )
     """,
-
     """
     CREATE TABLE IF NOT EXISTS _field_registry (
         id          TEXT NOT NULL,
@@ -212,7 +214,6 @@ BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
         PRIMARY KEY ("table", id)
     )
     """,
-
     """
     CREATE TABLE IF NOT EXISTS _trash (
         id           UUID PRIMARY KEY DEFAULT arc_uuid_generate_v7(),
@@ -252,7 +253,6 @@ BOOTSTRAP_FUNCTIONS_SQL: list[str] = [
     END;
     $$ LANGUAGE plpgsql VOLATILE
     """,
-
     """
     CREATE OR REPLACE FUNCTION arc_set_updated_at() RETURNS trigger AS $$
     BEGIN
@@ -261,7 +261,6 @@ BOOTSTRAP_FUNCTIONS_SQL: list[str] = [
     END;
     $$ LANGUAGE plpgsql
     """,
-
     # AFTER trigger: it runs inside the SAME transaction as the UPDATE that
     # set _state=99 (an AFTER ROW trigger fires after that statement's row
     # change, NOT after commit — which is exactly what lets a rolled-back
@@ -371,5 +370,5 @@ def audit_attach_sql(table: str, plugin: str) -> list[str]:
     return [
         f'DROP TRIGGER IF EXISTS {trigger} ON "{table}"',
         f'CREATE TRIGGER {trigger} AFTER INSERT OR UPDATE OR DELETE ON "{table}" '
-        f'FOR EACH ROW EXECUTE FUNCTION {trigger}()',
+        f"FOR EACH ROW EXECUTE FUNCTION {trigger}()",
     ]

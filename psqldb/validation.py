@@ -84,10 +84,16 @@ def friendly_fk_error(exc: Exception, *, table: str) -> ValidationError:
     doesn't match for some reason, rather than guessing."""
     constraint = getattr(exc, "constraint_name", "") or ""
     prefix, suffix = f"{table}_", "_fkey"
-    field = constraint[len(prefix):-len(suffix)] if constraint.startswith(prefix) and constraint.endswith(suffix) else None
+    field = (
+        constraint[len(prefix) : -len(suffix)]
+        if constraint.startswith(prefix) and constraint.endswith(suffix)
+        else None
+    )
     detail = getattr(exc, "detail", None) or str(exc)
     if field:
-        return ValidationError(f"'{table}': '{field}' references a row that doesn't exist ({detail})")
+        return ValidationError(
+            f"'{table}': '{field}' references a row that doesn't exist ({detail})"
+        )
     return ValidationError(f"'{table}': {detail}")
 
 
@@ -102,7 +108,11 @@ def friendly_unique_error(exc: Exception, *, table: str) -> ValidationError:
     operator mistake (a duplicate email, a duplicate role name)."""
     constraint = getattr(exc, "constraint_name", "") or ""
     prefix, suffix = f"{table}_", "_key"
-    field = constraint[len(prefix):-len(suffix)] if constraint.startswith(prefix) and constraint.endswith(suffix) else None
+    field = (
+        constraint[len(prefix) : -len(suffix)]
+        if constraint.startswith(prefix) and constraint.endswith(suffix)
+        else None
+    )
     detail = getattr(exc, "detail", None) or str(exc)
     if field:
         return ValidationError(f"'{table}': '{field}' must be unique ({detail})")

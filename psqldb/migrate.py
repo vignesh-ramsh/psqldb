@@ -44,9 +44,14 @@ change):
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import datetime as dt
 import heapq
-from dataclasses import dataclass, field as dc_field
+import logging
+import zlib
+from dataclasses import dataclass
+from dataclasses import field as dc_field
 from pathlib import Path
 from typing import Any, Literal
 
@@ -54,10 +59,29 @@ from . import ddl, introspect
 from .fields import Field
 from .model import SchemaError, TableSchema, load_schemas_dir
 
+_logger = logging.getLogger("psqldb")
+
+# One fixed key shared by every `arc psqldb migrate` run against every
+# database — a stable (deterministic, not Python's salted hash()) 32-bit
+# value derived from a fixed string, well within Postgres's signed-bigint
+# advisory-lock key range. Not a real secret, not table/schema-specific:
+# the whole point is that ANY two migrate runs against the SAME database
+# contend for the SAME lock, regardless of which plugin/table triggered
+# them.
+MIGRATE_LOCK_KEY = zlib.crc32(b"arc_psqldb_migrate")
+
 OpKind = Literal[
-    "create_table", "drop_table", "add_column", "drop_column",
-    "rename_column", "alter_type", "set_not_null", "drop_not_null",
-    "add_unique", "drop_unique", "ensure_index",
+    "create_table",
+    "drop_table",
+    "add_column",
+    "drop_column",
+    "rename_column",
+    "alter_type",
+    "set_not_null",
+    "drop_not_null",
+    "add_unique",
+    "drop_unique",
+    "ensure_index",
 ]
 OpSource = Literal["schema", "patch"]
 
@@ -67,8 +91,8 @@ class Op:
     kind: OpKind
     table: str
     plugin: str
-    description: str          # human-readable, shown in `plan`/`migrate`
-    sql: list[str]            # statement(s) that implement this op
+    description: str  # human-readable, shown in `plan`/`migrate`
+    sql: list[str]  # statement(s) that implement this op
     destructive: bool = False
     source: OpSource = "schema"
 
@@ -76,10 +100,16 @@ class Op:
 @dataclass
 class MigrationPlan:
     ops: list[Op] = dc_field(default_factory=list)
-    schemas: list[TableSchema] = dc_field(default_factory=list)   # schemas + patches this plan covers
-    ref_targets: dict[str, str] = dc_field(default_factory=dict)  # schema-stem -> physical table name
-    ref_columns: dict[tuple[str, str], "ddl.RefColumn"] = dc_field(default_factory=dict)  # (table, field name) -> resolved target
-    warnings: list[str] = dc_field(default_factory=list)          # e.g. "skipped patch for missing table"
+    schemas: list[TableSchema] = dc_field(
+        default_factory=list
+    )  # schemas + patches this plan covers
+    ref_targets: dict[str, str] = dc_field(
+        default_factory=dict
+    )  # schema-stem -> physical table name
+    ref_columns: dict[tuple[str, str], "ddl.RefColumn"] = dc_field(
+        default_factory=dict
+    )  # (table, field name) -> resolved target
+    warnings: list[str] = dc_field(default_factory=list)  # e.g. "skipped patch for missing table"
 
     def destructive_ops(self) -> list[Op]:
         return [op for op in self.ops if op.destructive]
@@ -96,6 +126,50 @@ class MigrationPlan:
 
 class MigrationError(RuntimeError):
     pass
+
+
+@contextlib.asynccontextmanager
+async def migration_lock(conn: Any, *, poll_interval: float = 1.0):
+    """Serializes concurrent `arc psqldb migrate` runs against the same
+    database — two replicas deploying at once must not both diff-and-apply
+    DDL concurrently. Uses Postgres's own session-level advisory lock
+    (pg_advisory_lock/pg_try_advisory_lock/pg_advisory_unlock): it works
+    over the SAME connection already in use (no extra infrastructure, no
+    redix dependency), and Postgres releases it automatically if this
+    process or connection dies — no stale-lock cleanup to ever handle.
+
+    Deliberately BLOCKS (polling pg_try_advisory_lock rather than the
+    blocking pg_advisory_lock, so a friendly "waiting" message can be
+    logged once rather than the caller just appearing to hang) instead of
+    failing outright — "serialize", not "reject": the second replica
+    should wait its turn, then build a plan against the now-already-
+    migrated database and find nothing left to do, not error out just
+    because it lost a race.
+
+    IMPORTANT: this is a SESSION-level lock, tied to `conn` itself, not to
+    the transaction migrate.apply_plan() opens inside it — returning `conn`
+    to the pool afterward does NOT close the underlying connection (the
+    pool reuses it), so the lock is only ever released by the explicit
+    pg_advisory_unlock in `finally` below, never implicitly. Every caller
+    MUST use this as a context manager (`async with migration_lock(conn):`)
+    so that release always runs, including when the protected code raises.
+    """
+    announced = False
+    while True:
+        acquired = await conn.fetchval("SELECT pg_try_advisory_lock($1)", MIGRATE_LOCK_KEY)
+        if acquired:
+            break
+        if not announced:
+            _logger.info(
+                "another `arc psqldb migrate` is already running against this "
+                "database — waiting for it to finish..."
+            )
+            announced = True
+        await asyncio.sleep(poll_interval)
+    try:
+        yield
+    finally:
+        await conn.execute("SELECT pg_advisory_unlock($1)", MIGRATE_LOCK_KEY)
 
 
 def _q(value: Any) -> str:
@@ -144,23 +218,51 @@ def _resolve_child_owners(schemas: list[TableSchema]) -> dict[str, TableSchema]:
     return {stem: by_stem[stem] for stem in by_stem if by_stem[stem].child}
 
 
+#  resolve_ref_targets's own "logged once, not every call" set for the
+# table-name-spelling fallback below — module-level and never cleared, on
+# purpose: the point is one notice per distinct `target` value for the
+# lifetime of the process, not one per resolve_ref_targets() call (which
+# may run repeatedly — plan, then migrate, then a system.reload
+# recomputing psqldb's own cached ref_targets()).
+_warned_table_name_targets: set[str] = set()
+
+
 def resolve_ref_targets(schemas: list[TableSchema]) -> dict[str, str]:
-    """Maps each REFERENCE/TABLE field's raw `target` (a schema-file stem,
-    e.g. "Employee") to the physical, slugified table it resolves to (e.g.
-    "employee"). Used both for DDL rendering and for insert()-time FK
-    existence checks (psqldb.validation). Callers pass schemas + patches
-    together so a patch's own REFERENCE fields resolve against the same
-    known-table set schemas do."""
+    """Maps each REFERENCE/TABLE field's raw `target` to the physical,
+    slugified table it resolves to (e.g. "Employee" -> "employee"). Used
+    both for DDL rendering and for insert()-time FK existence checks
+    (psqldb.validation). Callers pass schemas + patches together so a
+    patch's own REFERENCE fields resolve against the same known-table set
+    schemas do.
+
+    `target` is conventionally a schema-file STEM ("Employee") — but a
+    field naming the physical TABLE name directly ("employee") now also
+    resolves, with one logged notice per distinct target the first time
+    it's used that way, never a hard error: both spellings mean the exact
+    same table (the physical name a schema file's own stem produces), so
+    there's no real ambiguity to worry about — just a footgun the resolver
+    can remove instead of leaving it to documentation."""
     by_stem = {s.source_path.stem: s for s in schemas}
+    by_table = {s.table: s for s in schemas}
     ref_targets: dict[str, str] = {}
     for s in schemas:
         for f in s.fields:
             if f.type in ("REFERENCE", "TABLE") and f.target:
                 target_schema = by_stem.get(f.target)
                 if target_schema is None:
+                    target_schema = by_table.get(f.target)
+                    if target_schema is not None and f.target not in _warned_table_name_targets:
+                        _warned_table_name_targets.add(f.target)
+                        _logger.info(
+                            f"schema '{s.table}', field '{f.name}': target '{f.target}' "
+                            f"is a physical table name — resolved fine, but the "
+                            f"conventional spelling is the schema file's own stem "
+                            f"('{target_schema.source_path.stem}')."
+                        )
+                if target_schema is None:
                     raise MigrationError(
                         f"schema '{s.table}', field '{f.name}': target '{f.target}' "
-                        f"does not match any known schema file name."
+                        f"does not match any known schema file name or table name."
                     )
                 ref_targets[f.target] = target_schema.table
     return ref_targets
@@ -198,10 +300,14 @@ def resolve_ref_columns(
                 continue
             target_table = ref_targets[f.target]
             if f.target_field is None:
-                ref_columns[(s.table, f.name)] = ddl.RefColumn(table=target_table, column="id", sql_type="UUID")
+                ref_columns[(s.table, f.name)] = ddl.RefColumn(
+                    table=target_table, column="id", sql_type="UUID"
+                )
                 continue
             target_schema = by_stem[f.target]
-            target_field = next((tf for tf in target_schema.fields if tf.name == f.target_field), None)
+            target_field = next(
+                (tf for tf in target_schema.fields if tf.name == f.target_field), None
+            )
             if target_field is None:
                 raise MigrationError(
                     f"schema '{s.table}', field '{f.name}': target_field "
@@ -212,7 +318,7 @@ def resolve_ref_columns(
                 raise MigrationError(
                     f"schema '{s.table}', field '{f.name}': target_field "
                     f"'{f.target_field}' on '{target_table}' is not declared "
-                    f"\"unique\": true — Postgres can only create a foreign key "
+                    f'"unique": true — Postgres can only create a foreign key '
                     f"against a unique column. Mark '{f.target_field}' "
                     f"\"unique\": true on its own schema ('{f.target}'), or remove "
                     f"target_field on '{s.table}'.'{f.name}' to reference the "
@@ -335,7 +441,8 @@ def order_for_create(
 
 
 def _order_and_link(
-    schemas: list[TableSchema], ref_targets: dict[str, str],
+    schemas: list[TableSchema],
+    ref_targets: dict[str, str],
     ref_columns: dict[tuple[str, str], "ddl.RefColumn"] | None = None,
 ) -> tuple[list[TableSchema], dict[str, str]]:
     """Returns (ordered schemas — parents before children, each bucket
@@ -364,8 +471,12 @@ def _order_and_link(
 # Diffing one table (schema OR patch — see module docstring)
 # ------------------------------------------------------------------------ #
 async def _diff_table(
-    conn: Any, schema: TableSchema, *, ref_targets: dict[str, str],
-    ref_columns: dict[tuple[str, str], "ddl.RefColumn"], parent_table: str | None,
+    conn: Any,
+    schema: TableSchema,
+    *,
+    ref_targets: dict[str, str],
+    ref_columns: dict[tuple[str, str], "ddl.RefColumn"],
+    parent_table: str | None,
 ) -> tuple[list[Op], list[str], bool]:
     """Returns (ops, warnings, skipped). `skipped=True` means this schema/
     patch was NOT compared against anything — its target table doesn't
@@ -376,18 +487,34 @@ async def _diff_table(
 
     if not exists:
         if schema.is_patch:
-            return [], [
-                f"skipped patch '{schema.source_path.name}' (plugin '{schema.plugin}') — "
-                f"table '{schema.table}' does not exist yet."
-            ], True
+            return (
+                [],
+                [
+                    f"skipped patch '{schema.source_path.name}' (plugin '{schema.plugin}') — "
+                    f"table '{schema.table}' does not exist yet."
+                ],
+                True,
+            )
         stmts = ddl.create_table_sql(schema, parent_table=parent_table, ref_columns=ref_columns)
-        return [Op(
-            kind="create_table", table=schema.table, plugin=schema.plugin, source=source,
-            description=f'CREATE TABLE "{schema.table}" ({len(schema.column_fields())} fields)',
-            sql=stmts, destructive=False,
-        )], [], False
+        return (
+            [
+                Op(
+                    kind="create_table",
+                    table=schema.table,
+                    plugin=schema.plugin,
+                    source=source,
+                    description=f'CREATE TABLE "{schema.table}" ({len(schema.column_fields())} fields)',
+                    sql=stmts,
+                    destructive=False,
+                )
+            ],
+            [],
+            False,
+        )
 
-    all_rows = await introspect.registry_rows(conn, schema.table)  # every plugin that touches this table
+    all_rows = await introspect.registry_rows(
+        conn, schema.table
+    )  # every plugin that touches this table
     mine = {row["id"]: row for row in all_rows if row["plugin"] == schema.plugin}
     others = [row for row in all_rows if row["plugin"] != schema.plugin]
 
@@ -428,21 +555,34 @@ async def _diff_table(
                     f"field ids or modify field ids it already owns."
                 )
             col_sql = f'ALTER TABLE "{schema.table}" ADD COLUMN {_column_def(f, schema.table, ref_columns)}'
-            ops.append(Op(
-                kind="add_column", table=schema.table, plugin=schema.plugin, source=source,
-                description=f'{schema.table}: ADD COLUMN "{f.name}" ({f.type})',
-                sql=[col_sql], destructive=False,
-            ))
+            ops.append(
+                Op(
+                    kind="add_column",
+                    table=schema.table,
+                    plugin=schema.plugin,
+                    source=source,
+                    description=f'{schema.table}: ADD COLUMN "{f.name}" ({f.type})',
+                    sql=[col_sql],
+                    destructive=False,
+                )
+            )
             continue
 
         prev = mine[fid]
         if prev["name"] != f.name:
-            ops.append(Op(
-                kind="rename_column", table=schema.table, plugin=schema.plugin, source=source,
-                description=f'{schema.table}: RENAME COLUMN "{prev["name"]}" -> "{f.name}"',
-                sql=[f'ALTER TABLE "{schema.table}" RENAME COLUMN "{prev["name"]}" TO "{f.name}"'],
-                destructive=False,
-            ))
+            ops.append(
+                Op(
+                    kind="rename_column",
+                    table=schema.table,
+                    plugin=schema.plugin,
+                    source=source,
+                    description=f'{schema.table}: RENAME COLUMN "{prev["name"]}" -> "{f.name}"',
+                    sql=[
+                        f'ALTER TABLE "{schema.table}" RENAME COLUMN "{prev["name"]}" TO "{f.name}"'
+                    ],
+                    destructive=False,
+                )
+            )
 
         if f.type == "REFERENCE" and prev.get("ref_field") != f.target_field:
             # Changing what an EXISTING REFERENCE field points at isn't
@@ -461,49 +601,87 @@ async def _diff_table(
                 f"and add it again as a new one instead."
             )
 
-        resolved_sql_type = ref_columns[(schema.table, f.name)].sql_type if f.type == "REFERENCE" else f.sql_type()
+        resolved_sql_type = (
+            ref_columns[(schema.table, f.name)].sql_type if f.type == "REFERENCE" else f.sql_type()
+        )
         type_changed = prev["type"] != f.type
-        length_changed = prev.get("length") != f.length and f.type in ("STRING", "SELECT", "EMAIL", "PHONE")
+        length_changed = prev.get("length") != f.length and f.type in (
+            "STRING",
+            "SELECT",
+            "EMAIL",
+            "PHONE",
+        )
         if type_changed or length_changed:
-            ops.append(Op(
-                kind="alter_type", table=schema.table, plugin=schema.plugin, source=source,
-                description=f'{schema.table}: ALTER COLUMN "{f.name}" TYPE {resolved_sql_type} (was {prev["type"]}) — REVIEW: may fail or truncate data',
-                sql=[f'ALTER TABLE "{schema.table}" ALTER COLUMN "{f.name}" TYPE {resolved_sql_type} USING "{f.name}"::{resolved_sql_type}'],
-                destructive=True,
-            ))
+            ops.append(
+                Op(
+                    kind="alter_type",
+                    table=schema.table,
+                    plugin=schema.plugin,
+                    source=source,
+                    description=f'{schema.table}: ALTER COLUMN "{f.name}" TYPE {resolved_sql_type} (was {prev["type"]}) — REVIEW: may fail or truncate data',
+                    sql=[
+                        f'ALTER TABLE "{schema.table}" ALTER COLUMN "{f.name}" TYPE {resolved_sql_type} USING "{f.name}"::{resolved_sql_type}'
+                    ],
+                    destructive=True,
+                )
+            )
 
         if bool(prev["reqd"]) != f.required:
             if f.required:
-                ops.append(Op(
-                    kind="set_not_null", table=schema.table, plugin=schema.plugin, source=source,
-                    description=f'{schema.table}: SET NOT NULL on "{f.name}" — REVIEW: fails if existing rows have NULL',
-                    sql=[f'ALTER TABLE "{schema.table}" ALTER COLUMN "{f.name}" SET NOT NULL'],
-                    destructive=True,
-                ))
+                ops.append(
+                    Op(
+                        kind="set_not_null",
+                        table=schema.table,
+                        plugin=schema.plugin,
+                        source=source,
+                        description=f'{schema.table}: SET NOT NULL on "{f.name}" — REVIEW: fails if existing rows have NULL',
+                        sql=[f'ALTER TABLE "{schema.table}" ALTER COLUMN "{f.name}" SET NOT NULL'],
+                        destructive=True,
+                    )
+                )
             else:
-                ops.append(Op(
-                    kind="drop_not_null", table=schema.table, plugin=schema.plugin, source=source,
-                    description=f'{schema.table}: DROP NOT NULL on "{f.name}"',
-                    sql=[f'ALTER TABLE "{schema.table}" ALTER COLUMN "{f.name}" DROP NOT NULL'],
-                    destructive=False,
-                ))
+                ops.append(
+                    Op(
+                        kind="drop_not_null",
+                        table=schema.table,
+                        plugin=schema.plugin,
+                        source=source,
+                        description=f'{schema.table}: DROP NOT NULL on "{f.name}"',
+                        sql=[f'ALTER TABLE "{schema.table}" ALTER COLUMN "{f.name}" DROP NOT NULL'],
+                        destructive=False,
+                    )
+                )
 
         if bool(prev["unique"]) != f.unique:
             constraint = f"{schema.table}_{f.name}_key"
             if f.unique:
-                ops.append(Op(
-                    kind="add_unique", table=schema.table, plugin=schema.plugin, source=source,
-                    description=f'{schema.table}: ADD UNIQUE ("{f.name}") — REVIEW: fails if duplicates already exist',
-                    sql=[f'ALTER TABLE "{schema.table}" ADD CONSTRAINT "{constraint}" UNIQUE ("{f.name}")'],
-                    destructive=True,
-                ))
+                ops.append(
+                    Op(
+                        kind="add_unique",
+                        table=schema.table,
+                        plugin=schema.plugin,
+                        source=source,
+                        description=f'{schema.table}: ADD UNIQUE ("{f.name}") — REVIEW: fails if duplicates already exist',
+                        sql=[
+                            f'ALTER TABLE "{schema.table}" ADD CONSTRAINT "{constraint}" UNIQUE ("{f.name}")'
+                        ],
+                        destructive=True,
+                    )
+                )
             else:
-                ops.append(Op(
-                    kind="drop_unique", table=schema.table, plugin=schema.plugin, source=source,
-                    description=f'{schema.table}: DROP UNIQUE ("{f.name}")',
-                    sql=[f'ALTER TABLE "{schema.table}" DROP CONSTRAINT IF EXISTS "{constraint}"'],
-                    destructive=False,
-                ))
+                ops.append(
+                    Op(
+                        kind="drop_unique",
+                        table=schema.table,
+                        plugin=schema.plugin,
+                        source=source,
+                        description=f'{schema.table}: DROP UNIQUE ("{f.name}")',
+                        sql=[
+                            f'ALTER TABLE "{schema.table}" DROP CONSTRAINT IF EXISTS "{constraint}"'
+                        ],
+                        destructive=False,
+                    )
+                )
 
     for fid, prev in mine.items():
         if fid in current:
@@ -527,15 +705,25 @@ async def _diff_table(
         ops.append(_drop_column_op(schema, prev, source=source))
 
     ops += [
-        Op(kind="ensure_index", table=schema.table, plugin=schema.plugin, source=source,
-           description=f'{schema.table}: ensure index "{idx["key"]}"', sql=[stmt], destructive=False)
+        Op(
+            kind="ensure_index",
+            table=schema.table,
+            plugin=schema.plugin,
+            source=source,
+            description=f'{schema.table}: ensure index "{idx["key"]}"',
+            sql=[stmt],
+            destructive=False,
+        )
         for idx, stmt in zip(schema.indexes, ddl.index_sql(schema))
     ]
     return ops, [], False
 
 
-def _column_def(f: Field, owner_table: str, ref_columns: dict[tuple[str, str], "ddl.RefColumn"]) -> str:
+def _column_def(
+    f: Field, owner_table: str, ref_columns: dict[tuple[str, str], "ddl.RefColumn"]
+) -> str:
     from .ddl import _user_column_sql  # noqa: PLC0415 - internal helper, not part of ddl's public surface
+
     return _user_column_sql(f, owner_table=owner_table, ref_columns=ref_columns)
 
 
@@ -548,15 +736,19 @@ def _drop_column_op(schema: TableSchema, prev: dict, *, source: OpSource) -> Op:
     col = prev["name"]
     snapshot_sql = (
         f'INSERT INTO _trash ("table", drop_type, snapshot, deleted_at) '
-        f'SELECT \'{_q(schema.table)}\', \'Column\', '
-        f'jsonb_build_object(\'_row_id\', id, \'{_q(col)}\', "{col}"), now() '
+        f"SELECT '{_q(schema.table)}', 'Column', "
+        f"jsonb_build_object('_row_id', id, '{_q(col)}', \"{col}\"), now() "
         f'FROM "{schema.table}"'
     )
     drop_sql = f'ALTER TABLE "{schema.table}" DROP COLUMN "{col}"'
     return Op(
-        kind="drop_column", table=schema.table, plugin=schema.plugin, source=source,
+        kind="drop_column",
+        table=schema.table,
+        plugin=schema.plugin,
+        source=source,
         description=f'{schema.table}: DROP COLUMN "{col}" — every existing value snapshotted to _trash first',
-        sql=[snapshot_sql, drop_sql], destructive=True,
+        sql=[snapshot_sql, drop_sql],
+        destructive=True,
     )
 
 
@@ -582,23 +774,35 @@ async def build_plan(
     # functions first is safe on a fresh database — plpgsql doesn't resolve
     # gen_random_bytes()/table references until execution, so nothing here
     # needs pgcrypto or _trash to exist yet.
-    plan.ops.append(Op(
-        kind="create_table", table="_bootstrap", plugin="psqldb",
-        description="ensure shared trigger functions (arc_uuid_generate_v7, "
-                    "arc_set_updated_at, arc_soft_delete_to_trash) are current",
-        sql=list(ddl.BOOTSTRAP_FUNCTIONS_SQL), destructive=False,
-    ))
+    plan.ops.append(
+        Op(
+            kind="create_table",
+            table="_bootstrap",
+            plugin="psqldb",
+            description="ensure shared trigger functions (arc_uuid_generate_v7, "
+            "arc_set_updated_at, arc_soft_delete_to_trash) are current",
+            sql=list(ddl.BOOTSTRAP_FUNCTIONS_SQL),
+            destructive=False,
+        )
+    )
     if not bootstrapped:
-        plan.ops.append(Op(
-            kind="create_table", table="_bootstrap", plugin="psqldb",
-            description="bootstrap: pgcrypto extension, _field_registry, _trash, _patch_history",
-            sql=list(ddl.BOOTSTRAP_STRUCTURAL_SQL), destructive=False,
-        ))
+        plan.ops.append(
+            Op(
+                kind="create_table",
+                table="_bootstrap",
+                plugin="psqldb",
+                description="bootstrap: pgcrypto extension, _field_registry, _trash, _patch_history",
+                sql=list(ddl.BOOTSTRAP_STRUCTURAL_SQL),
+                destructive=False,
+            )
+        )
 
     _resolve_child_owners(schemas)  # validates ownership; raises MigrationError on violation
     system_tables = {s.table for s in schemas if s.system}
     ref_targets = resolve_ref_targets([*schemas, *patches])
-    ref_columns = resolve_ref_columns([*schemas, *patches], ref_targets)  # validates target_field ownership/uniqueness
+    ref_columns = resolve_ref_columns(
+        [*schemas, *patches], ref_targets
+    )  # validates target_field ownership/uniqueness
     ordered, parent_of = _order_and_link(schemas, ref_targets, ref_columns)
 
     targets = [*ordered, *patches]
@@ -607,17 +811,24 @@ async def build_plan(
         if not targets:
             raise MigrationError(f"no declared schema or patch produces table '{only_table}'.")
 
-    applied: list[TableSchema] = []  # schemas/patches actually diffed — NOT skipped ones (see _diff_table)
+    applied: list[
+        TableSchema
+    ] = []  # schemas/patches actually diffed — NOT skipped ones (see _diff_table)
     seen_plugins: set[str] = set()
     for schema in ordered:
         if only_table and schema not in targets:
             continue
         if schema.audit and schema.plugin not in seen_plugins:
-            plan.ops.append(Op(
-                kind="create_table", table=f"_audit_{schema.plugin}", plugin=schema.plugin,
-                description=f'ensure audit table "_audit_{schema.plugin}" exists',
-                sql=ddl.audit_table_sql(schema.plugin), destructive=False,
-            ))
+            plan.ops.append(
+                Op(
+                    kind="create_table",
+                    table=f"_audit_{schema.plugin}",
+                    plugin=schema.plugin,
+                    description=f'ensure audit table "_audit_{schema.plugin}" exists',
+                    sql=ddl.audit_table_sql(schema.plugin),
+                    destructive=False,
+                )
+            )
             # Only mark a plugin "seen" once its audit table has actually
             # been ensured — adding it unconditionally here (for EVERY
             # schema, audited or not) meant a plugin whose first-processed
@@ -630,7 +841,11 @@ async def build_plan(
             seen_plugins.add(schema.plugin)
 
         table_ops, warns, skipped = await _diff_table(
-            conn, schema, ref_targets=ref_targets, ref_columns=ref_columns, parent_table=parent_of.get(schema.table)
+            conn,
+            schema,
+            ref_targets=ref_targets,
+            ref_columns=ref_columns,
+            parent_table=parent_of.get(schema.table),
         )
         plan.ops.extend(table_ops)
         plan.warnings.extend(warns)
@@ -638,11 +853,16 @@ async def build_plan(
             applied.append(schema)
 
         if schema.audit:
-            plan.ops.append(Op(
-                kind="ensure_index", table=schema.table, plugin=schema.plugin,
-                description=f'{schema.table}: attach audit trigger',
-                sql=ddl.audit_attach_sql(schema.table, schema.plugin), destructive=False,
-            ))
+            plan.ops.append(
+                Op(
+                    kind="ensure_index",
+                    table=schema.table,
+                    plugin=schema.plugin,
+                    description=f"{schema.table}: attach audit trigger",
+                    sql=ddl.audit_attach_sql(schema.table, schema.plugin),
+                    destructive=False,
+                )
+            )
 
     for patch in patches:
         if only_table and patch not in targets:
@@ -697,8 +917,11 @@ async def apply_plan(conn: Any, plan: MigrationPlan, *, reference: str) -> None:
 
 async def _dropped_table_ops(conn: Any, declared: list[TableSchema]) -> list[Op]:
     declared_names = {s.table for s in declared}
-    rows = await conn.fetch('select distinct "table" from _field_registry') \
-        if await introspect.bootstrap_applied(conn) else []
+    rows = (
+        await conn.fetch('select distinct "table" from _field_registry')
+        if await introspect.bootstrap_applied(conn)
+        else []
+    )
     ops = []
     for row in rows:
         table = row["table"]
@@ -709,18 +932,42 @@ async def _dropped_table_ops(conn: Any, declared: list[TableSchema]) -> list[Op]
         # first owner. Cosmetic only: which plugin's generated .sql file
         # mentions it, not which plugin's data gets dropped (all of it does,
         # snapshotted to _trash first, regardless of owner).
-        owners = await conn.fetch('select distinct plugin from _field_registry where "table" = $1', table)
+        owners = await conn.fetch(
+            'select distinct plugin from _field_registry where "table" = $1', table
+        )
         plugin = sorted(r["plugin"] for r in owners)[0] if owners else "unknown"
         snapshot_sql = (
             f'INSERT INTO _trash ("table", drop_type, snapshot, deleted_at) '
-            f'SELECT \'{_q(table)}\', \'Table\', to_jsonb(t), now() FROM "{table}" t'
+            f"SELECT '{_q(table)}', 'Table', to_jsonb(t), now() FROM \"{table}\" t"
         )
-        ops.append(Op(
-            kind="drop_table", table=table, plugin=plugin,
-            description=f'DROP TABLE "{table}" — every row snapshotted to _trash first',
-            sql=[snapshot_sql, f'DROP TABLE IF EXISTS "{table}"', f'DELETE FROM _field_registry WHERE "table" = \'{_q(table)}\''],
-            destructive=True,
-        ))
+        ops.append(
+            Op(
+                kind="drop_table",
+                table=table,
+                plugin=plugin,
+                description=f'DROP TABLE "{table}" — every row snapshotted to _trash first',
+                sql=[
+                    snapshot_sql,
+                    # CASCADE, not a plain DROP: when more than one
+                    # undeclared table is being dropped in the same plan
+                    # and they reference each other (e.g. a plugin with
+                    # several interrelated tables gets fully removed),
+                    # `rows` above has no guaranteed dependency order —
+                    # whichever side happens to be a referenced table's
+                    # target can be visited first, and a plain DROP TABLE
+                    # then fails with DependentObjectsStillExistError.
+                    # CASCADE only drops what actually depends on THIS
+                    # table (its own FK constraints, indexes, etc.) — it
+                    # does not touch any other table's ROWS — so a
+                    # still-being-dropped referencing table just loses the
+                    # now-moot constraint and gets its own snapshot+drop
+                    # normally when its own turn comes.
+                    f'DROP TABLE IF EXISTS "{table}" CASCADE',
+                    f"DELETE FROM _field_registry WHERE \"table\" = '{_q(table)}'",
+                ],
+                destructive=True,
+            )
+        )
     return ops
 
 
@@ -765,8 +1012,14 @@ def registry_upsert_sql(schemas: list[TableSchema], ref_targets: dict[str, str])
         for f in schema.fields:
             length = f.length if f.length is not None else "NULL"
             default = f"'{_q(f.default)}'" if f.default is not None else "NULL"
-            ref_table = f"'{_q(ref_targets[f.target])}'" if f.type in ("REFERENCE", "TABLE") else "NULL"
-            ref_field = f"'{_q(f.target_field)}'" if f.type == "REFERENCE" and f.target_field is not None else "NULL"
+            ref_table = (
+                f"'{_q(ref_targets[f.target])}'" if f.type in ("REFERENCE", "TABLE") else "NULL"
+            )
+            ref_field = (
+                f"'{_q(f.target_field)}'"
+                if f.type == "REFERENCE" and f.target_field is not None
+                else "NULL"
+            )
             stmts.append(
                 "INSERT INTO _field_registry "
                 '(id, name, "table", type, length, reqd, "unique", "default", ref_table, ref_field, source, plugin) '
@@ -808,7 +1061,9 @@ def migration_reference() -> str:
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
 
 
-def write_migration_file(plugin_dir: Path, plugin: str, plan: MigrationPlan, reference: str) -> Path:
+def write_migration_file(
+    plugin_dir: Path, plugin: str, plan: MigrationPlan, reference: str
+) -> Path:
     migrations_dir = plugin_dir / "migrations"
     migrations_dir.mkdir(parents=True, exist_ok=True)
     path = migrations_dir / f"{reference}_migration.sql"
