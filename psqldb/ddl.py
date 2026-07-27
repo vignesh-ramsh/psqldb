@@ -175,7 +175,16 @@ def trigger_attach_sql(table: str) -> list[str]:
 # system tables yet, only for business schemas. Until that exists, an
 # already-bootstrapped project picking up a psqldb change like this one
 # needs the ALTER run by hand once (e.g. `ALTER TABLE _field_registry ADD
-# COLUMN ref_field TEXT`).
+# COLUMN ref_field TEXT`). `precision`/`scale` (added alongside the DECIMAL
+# diffing fix, psqldb.migrate._diff_table) are the same class of change —
+# an already-bootstrapped project needs `ALTER TABLE _field_registry ADD
+# COLUMN precision INTEGER, ADD COLUMN scale INTEGER` run by hand once.
+# Existing DECIMAL fields already in the registry will read back NULL for
+# both until their next migrate re-registers them — the diff below treats
+# that as "unknown, therefore changed" (same safe-by-default posture as
+# every other destructive classification here), so the very next migrate
+# after this upgrade will show a one-time, harmless ALTER COLUMN TYPE
+# review op for each of them even though nothing really changed.
 # ------------------------------------------------------------------------ #
 BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
     "CREATE EXTENSION IF NOT EXISTS pgcrypto",
@@ -201,6 +210,8 @@ BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
         "table"     TEXT NOT NULL,
         type        TEXT NOT NULL,
         length      INTEGER,
+        precision   INTEGER,
+        scale       INTEGER,
         reqd        BOOLEAN NOT NULL DEFAULT FALSE,
         "index"     BOOLEAN NOT NULL DEFAULT FALSE,
         "unique"    BOOLEAN NOT NULL DEFAULT FALSE,
@@ -253,10 +264,28 @@ BOOTSTRAP_FUNCTIONS_SQL: list[str] = [
     END;
     $$ LANGUAGE plpgsql VOLATILE
     """,
+    # Only bumps updated_at when the row actually changed — psqldb.update()
+    # has no dirty-check of its own (it only guards "zero columns to set at
+    # all", psqldb/__init__.py), so a caller that saves a row with the
+    # SAME values it already has used to still issue a real UPDATE that
+    # unconditionally bumped updated_at (and, on an audited table, wrote a
+    # before==after row to _audit_* — see arc_audit_{plugin} below, which
+    # this fix also protects). Every OTHER caller of psqldb.update() besides
+    # the one place that added its own client-side dirty-check would
+    # reproduce that exact bug; fixing it here, in the one function every
+    # non-system table's UPDATE already goes through, protects all of them
+    # at once, at zero extra cost on the genuine-change path (BEFORE
+    # triggers already see both OLD and NEW for free — no extra query).
+    # Compares everything EXCEPT updated_at itself (which would otherwise
+    # always look "different" — OLD.updated_at is whatever it was last set
+    # to, NEW.updated_at hasn't been assigned yet at this point) using
+    # jsonb's `-` key-removal operator.
     """
     CREATE OR REPLACE FUNCTION arc_set_updated_at() RETURNS trigger AS $$
     BEGIN
-        NEW.updated_at := now();
+        IF to_jsonb(OLD) - 'updated_at' IS DISTINCT FROM to_jsonb(NEW) - 'updated_at' THEN
+            NEW.updated_at := now();
+        END IF;
         RETURN NEW;
     END;
     $$ LANGUAGE plpgsql
@@ -334,6 +363,18 @@ def audit_table_sql(plugin: str) -> list[str]:
             new_json jsonb := to_jsonb(NEW);
             old_json jsonb := to_jsonb(OLD);
         BEGIN
+            -- A genuinely no-op UPDATE (every column identical) writes no
+            -- audit row at all — arc_set_updated_at (a BEFORE trigger,
+            -- always fires first) already leaves updated_at itself
+            -- untouched in that same case, so old_json = new_json here
+            -- means the whole row, updated_at included, is unchanged. Only
+            -- applies to UPDATE: an INSERT/DELETE is never a "no-op" by
+            -- definition (the row didn't exist a moment ago, or won't a
+            -- moment from now), so both are always recorded regardless.
+            IF TG_OP = 'UPDATE' AND old_json = new_json THEN
+                RETURN NEW;
+            END IF;
+
             -- changed_by goes through the jsonb representation, not a direct
             -- NEW.updated_by/OLD.updated_by struct reference: this function is
             -- shared across every audited table for the plugin, and a

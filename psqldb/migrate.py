@@ -188,11 +188,38 @@ def _q(value: Any) -> str:
 # ------------------------------------------------------------------------ #
 def _resolve_child_owners(schemas: list[TableSchema]) -> dict[str, TableSchema]:
     """Every `child: true` schema must be targeted by exactly one TABLE
-    field somewhere. Returns {child_schema_stem: owning TableSchema}."""
+    field somewhere. Returns {child_schema_stem: owning TableSchema}.
+
+    Also validates the REVERSE direction, which used to go entirely
+    unchecked: a TABLE field's `target` must itself be a `child: true`
+    schema. TABLE fields render no column at all on the owning table
+    (Field.is_column() is False for TABLE), and a target schema that isn't
+    `child: true` gets ordinary NORMAL_SYSTEM_FIELDS (no `parent` column
+    either) — so a TABLE field pointing at a non-child schema used to be a
+    completely silent no-op: no column, no FK, no error, no warning. A
+    plugin author who simply forgot `"child": true` on the target got a
+    schema that parsed fine and a relationship that did nothing."""
     by_stem = {s.source_path.stem: s for s in schemas}
     owners: dict[str, list[str]] = {}
     for s in schemas:
         for f in s.child_fields():
+            target_schema = by_stem.get(f.target)
+            # An unresolvable target (matches no schema file at all) is
+            # left to resolve_ref_targets — called right after this in
+            # build_plan — to raise its own "unknown target" error; this
+            # function only adds the narrower check below, which fires
+            # when the target DOES exist but isn't a child schema.
+            if target_schema is not None and not target_schema.child:
+                raise MigrationError(
+                    f"schema '{s.table}', field '{f.name}' (type TABLE) targets "
+                    f"'{f.target}' ('{target_schema.table}'), which does not declare "
+                    f'"child": true — a TABLE field\'s target must be a child schema, '
+                    f"or the relationship is silently a no-op (TABLE fields render no "
+                    f"column on the owning table, and a non-child target gets no "
+                    f"'parent' column either). Add \"child\": true to '{f.target}', or "
+                    f"use type REFERENCE instead if you meant a plain link, not "
+                    f"ownership."
+                )
             owners.setdefault(f.target, []).append(s.table)
 
     for child in schemas:
@@ -477,13 +504,25 @@ async def _diff_table(
     ref_targets: dict[str, str],
     ref_columns: dict[tuple[str, str], "ddl.RefColumn"],
     parent_table: str | None,
+    will_exist: frozenset[str] = frozenset(),
 ) -> tuple[list[Op], list[str], bool]:
     """Returns (ops, warnings, skipped). `skipped=True` means this schema/
     patch was NOT compared against anything — its target table doesn't
     exist — and callers must NOT include it when upserting _field_registry
-    afterward: doing so would record bookkeeping for DDL that never ran."""
+    afterward: doing so would record bookkeeping for DDL that never ran.
+
+    `will_exist` — tables a schema IN THIS SAME build_plan call is already
+    creating, even though the live database doesn't have them yet (build_plan
+    only plans, it never executes its own ops — see module docstring).
+    Without this, a patch whose target table is being created for the very
+    first time by its own plugin's schema, in the same migrate run, always
+    looked like it targeted a nonexistent table and was silently skipped
+    with just a warning — needing a SECOND `arc psqldb migrate` before the
+    patch's fields ever actually applied. build_plan processes every schema
+    before any patch (see its own loop order), so by the time a patch is
+    diffed, `will_exist` already reflects every table this pass is creating."""
     source: OpSource = "patch" if schema.is_patch else "schema"
-    exists = await introspect.table_exists(conn, schema.table)
+    exists = await introspect.table_exists(conn, schema.table) or schema.table in will_exist
 
     if not exists:
         if schema.is_patch:
@@ -555,15 +594,29 @@ async def _diff_table(
                     f"field ids or modify field ids it already owns."
                 )
             col_sql = f'ALTER TABLE "{schema.table}" ADD COLUMN {_column_def(f, schema.table, ref_columns)}'
+            # A required column with no default is only safe to add on a
+            # table with zero rows — Postgres has nothing to backfill
+            # existing rows with, and ADD COLUMN ... NOT NULL (no DEFAULT)
+            # fails outright the moment the table has ≥1 row. Every other
+            # similarly-risky op here (set_not_null, alter_type, add_unique)
+            # is marked destructive=True for exactly this class of risk;
+            # add_column was the one exception, always green/"safe" in the
+            # plan even when it was this likely to fail at apply time.
+            risky = f.required and f.default is None
             ops.append(
                 Op(
                     kind="add_column",
                     table=schema.table,
                     plugin=schema.plugin,
                     source=source,
-                    description=f'{schema.table}: ADD COLUMN "{f.name}" ({f.type})',
+                    description=(
+                        f'{schema.table}: ADD COLUMN "{f.name}" ({f.type}) NOT NULL, no default — '
+                        f"REVIEW: fails if the table already has any rows"
+                        if risky
+                        else f'{schema.table}: ADD COLUMN "{f.name}" ({f.type})'
+                    ),
                     sql=[col_sql],
-                    destructive=False,
+                    destructive=risky,
                 )
             )
             continue
@@ -584,22 +637,42 @@ async def _diff_table(
                 )
             )
 
-        if f.type == "REFERENCE" and prev.get("ref_field") != f.target_field:
+        if f.type == "REFERENCE":
             # Changing what an EXISTING REFERENCE field points at isn't
             # automated — unlike a plain type/length change, this also means
             # the FK constraint itself has to be dropped and recreated
-            # against a different column, not just the column's type altered.
-            # Rather than guess at that sequence (and risk emitting SQL that
-            # silently does the wrong thing), this is a hard stop: drop the
-            # field and add it again as a new one, going through the
-            # existing (already-safe, already-Trash-backed) drop+add path.
-            raise MigrationError(
-                f"{'patch' if schema.is_patch else 'schema'} '{schema.source_path.name}' "
-                f"(plugin '{schema.plugin}'), field '{f.name}': target_field changed "
-                f"from {prev.get('ref_field')!r} to {f.target_field!r} — changing what "
-                f"an existing REFERENCE field points at isn't automated. Drop the field "
-                f"and add it again as a new one instead."
-            )
+            # against a different column (or a different TABLE entirely),
+            # not just the column's type altered. Rather than guess at that
+            # sequence (and risk emitting SQL that silently does the wrong
+            # thing), this is a hard stop: drop the field and add it again
+            # as a new one, going through the existing (already-safe,
+            # already-Trash-backed) drop+add path.
+            #
+            # Checks BOTH target_field (which column on the target) AND the
+            # target TABLE itself — only target_field used to be compared
+            # here. A schema changing {"target": "Department"} to {"target":
+            # "Team"} on an existing field, with target_field unset both
+            # times, produced NO diff at all: prev["ref_field"] stayed None
+            # -> None (target_field never changed) and f.type stayed
+            # "REFERENCE" -> "REFERENCE" (so the type/length check below
+            # never fired either) — the live FK constraint kept pointing at
+            # the original table forever while the schema file claimed
+            # something else, with no error and no warning.
+            new_target_table = ref_columns[(schema.table, f.name)].table
+            ref_field_changed = prev.get("ref_field") != f.target_field
+            ref_table_changed = prev.get("ref_table") != new_target_table
+            if ref_field_changed or ref_table_changed:
+                changed = []
+                if ref_table_changed:
+                    changed.append(f"target table from {prev.get('ref_table')!r} to {new_target_table!r}")
+                if ref_field_changed:
+                    changed.append(f"target_field from {prev.get('ref_field')!r} to {f.target_field!r}")
+                raise MigrationError(
+                    f"{'patch' if schema.is_patch else 'schema'} '{schema.source_path.name}' "
+                    f"(plugin '{schema.plugin}'), field '{f.name}': " + " and ".join(changed) + " — "
+                    "changing what an existing REFERENCE field points at isn't automated. Drop the "
+                    "field and add it again as a new one instead."
+                )
 
         resolved_sql_type = (
             ref_columns[(schema.table, f.name)].sql_type if f.type == "REFERENCE" else f.sql_type()
@@ -611,7 +684,17 @@ async def _diff_table(
             "EMAIL",
             "PHONE",
         )
-        if type_changed or length_changed:
+        # DECIMAL's own two dimensions — precision/scale — used to be
+        # invisible to this diff entirely: _field_registry had no columns to
+        # remember them in, so DECIMAL(10,2) -> DECIMAL(12,4) produced zero
+        # ops, silently leaving the live column on its original shape
+        # forever. `scale` defaults to 0 in both the schema (Field.sql_type)
+        # and here, so an unset scale on either side compares equal to an
+        # explicit 0 rather than a spurious mismatch.
+        decimal_changed = f.type == "DECIMAL" and (
+            prev.get("precision") != f.precision or (prev.get("scale") or 0) != (f.scale or 0)
+        )
+        if type_changed or length_changed or decimal_changed:
             ops.append(
                 Op(
                     kind="alter_type",
@@ -815,6 +898,14 @@ async def build_plan(
         TableSchema
     ] = []  # schemas/patches actually diffed — NOT skipped ones (see _diff_table)
     seen_plugins: set[str] = set()
+    # Tables a schema in THIS pass creates for the first time — build_plan
+    # never executes its own ops (pure planning), so the live database
+    # still doesn't have them by the time patches are diffed below, even
+    # though they're about to exist once apply_plan runs. Without this, a
+    # patch targeting a table its OWN plugin's schema creates in this same
+    # migrate run always looked like it targeted a nonexistent table and
+    # was silently skipped — see _diff_table's `will_exist` docstring.
+    will_exist: set[str] = set()
     for schema in ordered:
         if only_table and schema not in targets:
             continue
@@ -851,6 +942,8 @@ async def build_plan(
         plan.warnings.extend(warns)
         if not skipped:
             applied.append(schema)
+        if any(op.kind == "create_table" and op.table == schema.table for op in table_ops):
+            will_exist.add(schema.table)
 
         if schema.audit:
             plan.ops.append(
@@ -881,7 +974,12 @@ async def build_plan(
             )
             continue
         patch_ops, warns, skipped = await _diff_table(
-            conn, patch, ref_targets=ref_targets, ref_columns=ref_columns, parent_table=None
+            conn,
+            patch,
+            ref_targets=ref_targets,
+            ref_columns=ref_columns,
+            parent_table=None,
+            will_exist=frozenset(will_exist),
         )
         plan.ops.extend(patch_ops)
         plan.warnings.extend(warns)
@@ -1011,6 +1109,15 @@ def registry_upsert_sql(schemas: list[TableSchema], ref_targets: dict[str, str])
         source = "patch" if schema.is_patch else "schema"
         for f in schema.fields:
             length = f.length if f.length is not None else "NULL"
+            # precision/scale — DECIMAL only, NULL otherwise (mirrors length's
+            # own "NULL unless this type actually uses it" convention above).
+            # Stored so the next diff can actually SEE a precision/scale
+            # change (see _diff_table's decimal_changed) — before these two
+            # columns existed, a DECIMAL(10,2) -> DECIMAL(12,4) edit produced
+            # no diff op at all, silently leaving the live column on its
+            # original precision/scale forever.
+            precision = f.precision if f.type == "DECIMAL" and f.precision is not None else "NULL"
+            scale = f.scale if f.type == "DECIMAL" and f.scale is not None else "NULL"
             default = f"'{_q(f.default)}'" if f.default is not None else "NULL"
             ref_table = (
                 f"'{_q(ref_targets[f.target])}'" if f.type in ("REFERENCE", "TABLE") else "NULL"
@@ -1020,11 +1127,34 @@ def registry_upsert_sql(schemas: list[TableSchema], ref_targets: dict[str, str])
                 if f.type == "REFERENCE" and f.target_field is not None
                 else "NULL"
             )
+            # ON CONFLICT, not a plain INSERT: a patch legitimately
+            # redeclaring a field id ITS OWN plugin's schema also declares
+            # (psqldb.schema()'s own merge already treats this as "a
+            # legitimate rename/retype... supersedes the schema's version")
+            # used to crash outright with a duplicate-key violation on
+            # ("table", id) — the DELETE above runs once per (table,
+            # plugin), not once per entry, so a schema's own INSERT for an
+            # id and a same-plugin patch's INSERT for that SAME id both
+            # landed in the same transaction with nothing to stop the
+            # second from colliding with the first. Patches are always
+            # processed (and so always appear later in `schemas`, i.e.
+            # `plan.schemas`) after their own plugin's schema — see
+            # build_plan's loop order — so "last one in this list wins"
+            # naturally means the patch's version wins, matching schema()'s
+            # own override semantics exactly rather than a coincidence.
             stmts.append(
                 "INSERT INTO _field_registry "
-                '(id, name, "table", type, length, reqd, "unique", "default", ref_table, ref_field, source, plugin) '
+                '(id, name, "table", type, length, precision, scale, reqd, "unique", "default", '
+                "ref_table, ref_field, source, plugin) "
                 f"VALUES ('{_q(f.id)}', '{_q(f.name)}', '{_q(schema.table)}', '{_q(f.type)}', {length}, "
-                f"{f.required}, {f.unique}, {default}, {ref_table}, {ref_field}, '{source}', '{_q(schema.plugin)}')"
+                f"{precision}, {scale}, {f.required}, {f.unique}, {default}, {ref_table}, {ref_field}, "
+                f"'{source}', '{_q(schema.plugin)}') "
+                'ON CONFLICT ("table", id) DO UPDATE SET '
+                "name = EXCLUDED.name, type = EXCLUDED.type, length = EXCLUDED.length, "
+                "precision = EXCLUDED.precision, scale = EXCLUDED.scale, reqd = EXCLUDED.reqd, "
+                '"unique" = EXCLUDED."unique", "default" = EXCLUDED."default", '
+                "ref_table = EXCLUDED.ref_table, ref_field = EXCLUDED.ref_field, "
+                "source = EXCLUDED.source, plugin = EXCLUDED.plugin, updated_at = now()"
             )
     return stmts
 
