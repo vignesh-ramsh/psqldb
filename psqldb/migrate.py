@@ -738,8 +738,8 @@ async def _diff_table(
                 )
 
         if bool(prev["unique"]) != f.unique:
-            constraint = f"{schema.table}_{f.name}_key"
             if f.unique:
+                constraint = f"{schema.table}_{f.name}_key"
                 ops.append(
                     Op(
                         kind="add_unique",
@@ -754,6 +754,24 @@ async def _diff_table(
                     )
                 )
             else:
+                # The live constraint was created under whatever name the
+                # column had AT THAT TIME ("{table}_{column}_key", the same
+                # pattern the add_unique branch above names it with) — a
+                # RENAME COLUMN (above, in this SAME diff pass) renames only
+                # the column, never the constraint object itself. Using
+                # prev["name"] here rather than f.name is what makes a
+                # same-pass rename-then-drop-unique actually target the
+                # real, live constraint instead of a name that was never
+                # created (a silently no-op'd `IF EXISTS`, leaving the
+                # original constraint behind forever, still enforcing
+                # uniqueness the schema no longer declares — confirmed live
+                # against a real Postgres database before this fix).
+                # Narrower residual case, not handled here: a field renamed
+                # in an EARLIER, separate migrate run (while still unique)
+                # never had its constraint renamed either, so a unique-drop
+                # in a LATER run still won't find it under prev["name"] —
+                # only a same-pass rename+drop is covered.
+                constraint = f"{schema.table}_{prev['name']}_key"
                 ops.append(
                     Op(
                         kind="drop_unique",
