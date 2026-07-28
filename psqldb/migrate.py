@@ -82,6 +82,8 @@ OpKind = Literal[
     "add_unique",
     "drop_unique",
     "ensure_index",
+    "add_unique_together",
+    "drop_unique_together",
 ]
 OpSource = Literal["schema", "patch"]
 
@@ -802,6 +804,98 @@ async def _diff_table(
     return ops, [], False
 
 
+async def _diff_unique_together(
+    conn: Any, schema: TableSchema, *, table_exists: bool, bootstrapped: bool
+) -> list[Op]:
+    """Diffs schema.unique_together — the WHOLE declared list for this
+    table, not per-field — against _unique_together's registry rows,
+    ownership-scoped to schema.plugin exactly like _diff_table's own field
+    diffing (so one plugin's re-migrate never proposes dropping another
+    plugin's group on a table they both touch). Schema-only by
+    construction: unique_together is always `[]` on a patch
+    (schema_spec.PatchFileSpec has no such key), so this is only ever
+    called from the schemas loop in build_plan, never for patches.
+
+    `table_exists=False` is a deliberate, total no-op — a brand-new table
+    gets every declared group rendered INLINE by ddl.create_table_sql (a
+    CREATE TABLE statement can just list them as table constraints, no
+    ALTER needed); diffing here too would propose adding the exact same
+    constraint a second time.
+
+    `bootstrapped=False` is also a total no-op, for a different reason:
+    build_plan only *queues* the bootstrap op (BOOTSTRAP_STRUCTURAL_SQL,
+    which creates _unique_together) — it never executes its own plan, so
+    on a database bootstrapped before _unique_together existed, the table
+    genuinely isn't there yet during THIS build_plan call. Querying it
+    would be a hard UndefinedTableError on every already-existing table,
+    not just ones with a declared unique_together group. Skipping here is
+    safe: the very next build_plan call, after apply_plan has run the
+    queued bootstrap op, sees bootstrapped=True and diffs for real."""
+    if not table_exists or not bootstrapped:
+        return []
+
+    rows = await introspect.unique_together_rows(conn, schema.table)
+    mine = {r["key"]: r for r in rows if r["plugin"] == schema.plugin}
+    declared = {ut["key"]: ut for ut in schema.unique_together}
+
+    ops: list[Op] = []
+    for key, ut in declared.items():
+        if key in mine:
+            if sorted(mine[key]["fields"]) != sorted(ut["fields"]):
+                # Same "id/key is the stable identity, not the fields
+                # behind it" posture as a REFERENCE field's target change
+                # (§ _diff_table above) — changing the columns of an
+                # existing composite constraint isn't automated, since
+                # that's really a different constraint wearing the same
+                # name. Hard stop, before any SQL runs.
+                raise MigrationError(
+                    f"schema '{schema.source_path.name}' (plugin '{schema.plugin}'): "
+                    f"unique_together '{key}' changed its fields from "
+                    f"{mine[key]['fields']} to {ut['fields']} — changing an existing "
+                    f"composite constraint's columns isn't automated. Remove '{key}' "
+                    f"and declare a new group under a different key instead."
+                )
+            continue
+        exists = await introspect.constraint_exists(conn, schema.table, key)
+        if exists:
+            # Already there physically even though the registry doesn't
+            # know it yet (e.g. applied by an interrupted earlier run) —
+            # defensive idempotency, same reasoning create_table_sql's own
+            # `IF NOT EXISTS` already leans on elsewhere in this module.
+            continue
+        cols = ", ".join(ut["fields"])
+        ops.append(
+            Op(
+                kind="add_unique_together",
+                table=schema.table,
+                plugin=schema.plugin,
+                source="schema",
+                description=(
+                    f'{schema.table}: ADD CONSTRAINT "{key}" UNIQUE ({cols}) — '
+                    f"REVIEW: fails if duplicate combinations already exist"
+                ),
+                sql=[ddl.unique_together_sql(schema.table, ut)],
+                destructive=True,
+            )
+        )
+
+    for key, row in mine.items():
+        if key in declared:
+            continue
+        ops.append(
+            Op(
+                kind="drop_unique_together",
+                table=schema.table,
+                plugin=schema.plugin,
+                source="schema",
+                description=f'{schema.table}: DROP CONSTRAINT "{key}"',
+                sql=[ddl.drop_unique_together_sql(schema.table, key)],
+                destructive=False,
+            )
+        )
+    return ops
+
+
 def _column_def(
     f: Field, owner_table: str, ref_columns: dict[tuple[str, str], "ddl.RefColumn"]
 ) -> str:
@@ -942,6 +1036,21 @@ async def build_plan(
         plan.warnings.extend(warns)
         if not skipped:
             applied.append(schema)
+            # A brand-new table already got every declared unique_together
+            # group rendered INLINE by _diff_table's own create_table_sql
+            # call above — checking table_exists here (never introspect'd
+            # before this point; build_plan never executes its own ops, so
+            # the live database is unchanged regardless of what table_ops
+            # just computed) is what lets _diff_unique_together tell "new
+            # table, already handled" from "existing table, needs a real
+            # ALTER" apart, with no extra parameter threaded through
+            # _diff_table's own signature.
+            table_exists_now = await introspect.table_exists(conn, schema.table)
+            plan.ops.extend(
+                await _diff_unique_together(
+                    conn, schema, table_exists=table_exists_now, bootstrapped=bootstrapped
+                )
+            )
         if any(op.kind == "create_table" and op.table == schema.table for op in table_ops):
             will_exist.add(schema.table)
 
@@ -1009,6 +1118,8 @@ async def apply_plan(conn: Any, plan: MigrationPlan, *, reference: str) -> None:
                 await conn.execute(stmt)
         for stmt in registry_upsert_sql(plan.schemas, plan.ref_targets):
             await conn.execute(stmt)
+        for stmt in unique_together_upsert_sql(plan.schemas):
+            await conn.execute(stmt)
         for stmt in patch_history_sql(plan.ops, reference):
             await conn.execute(stmt)
 
@@ -1062,6 +1173,7 @@ async def _dropped_table_ops(conn: Any, declared: list[TableSchema]) -> list[Op]
                     # normally when its own turn comes.
                     f'DROP TABLE IF EXISTS "{table}" CASCADE',
                     f"DELETE FROM _field_registry WHERE \"table\" = '{_q(table)}'",
+                    f"DELETE FROM _unique_together WHERE \"table\" = '{_q(table)}'",
                 ],
                 destructive=True,
             )
@@ -1155,6 +1267,39 @@ def registry_upsert_sql(schemas: list[TableSchema], ref_targets: dict[str, str])
                 '"unique" = EXCLUDED."unique", "default" = EXCLUDED."default", '
                 "ref_table = EXCLUDED.ref_table, ref_field = EXCLUDED.ref_field, "
                 "source = EXCLUDED.source, plugin = EXCLUDED.plugin, updated_at = now()"
+            )
+    return stmts
+
+
+def unique_together_upsert_sql(schemas: list[TableSchema]) -> list[str]:
+    """After applying a plan, _unique_together is overwritten to match the
+    groups just applied — this IS the "previous state" _diff_unique_together
+    diffs the next declared list against, the same role registry_upsert_sql
+    plays for _field_registry. Same (table, plugin)-scoped, once-per-pair
+    DELETE-then-INSERT shape, and for the identical reason: a patch can
+    never declare unique_together (always `[]`), but IS unconditionally
+    present in `schemas` — deduping by (table, plugin) means a patch never
+    re-runs (and never wipes) the delete+insert its own schema already did
+    for the same pair, matching build_plan's loop order (schema before its
+    patches)."""
+    stmts = []
+    seen_table_plugin: set[tuple[str, str]] = set()
+    for schema in schemas:
+        key = (schema.table, schema.plugin)
+        if key in seen_table_plugin:
+            continue
+        seen_table_plugin.add(key)
+        stmts.append(
+            f"DELETE FROM _unique_together WHERE \"table\" = '{_q(schema.table)}' "
+            f"AND plugin = '{_q(schema.plugin)}'"
+        )
+        for ut in schema.unique_together:
+            fields_sql = "ARRAY[" + ", ".join(f"'{_q(f)}'" for f in ut["fields"]) + "]"
+            stmts.append(
+                'INSERT INTO _unique_together ("table", "key", fields, plugin) '
+                f"VALUES ('{_q(schema.table)}', '{_q(ut['key'])}', {fields_sql}, '{_q(schema.plugin)}') "
+                'ON CONFLICT ("table", "key") DO UPDATE SET '
+                "fields = EXCLUDED.fields, plugin = EXCLUDED.plugin, updated_at = now()"
             )
     return stmts
 

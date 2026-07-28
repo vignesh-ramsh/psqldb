@@ -125,6 +125,15 @@ def create_table_sql(
     for f in schema.fields:
         if f.is_column():
             columns.append(_user_column_sql(f, owner_table=schema.table, ref_columns=ref_columns))
+    # Table-level constraints mixed into the same paren'd list Postgres
+    # already accepts column defs in — a brand-new table gets its
+    # unique_together groups inline here; an EXISTING table picking one up
+    # on a later migrate goes through unique_together_sql's ALTER TABLE
+    # instead (see its own docstring for why: no "ADD CONSTRAINT IF NOT
+    # EXISTS" exists in Postgres, unlike CREATE INDEX).
+    for ut in schema.unique_together:
+        cols = ", ".join(f'"{c}"' for c in ut["fields"])
+        columns.append(f'CONSTRAINT "{ut["key"]}" UNIQUE ({cols})')
 
     stmts = [
         f'CREATE TABLE IF NOT EXISTS "{schema.table}" (\n    ' + ",\n    ".join(columns) + "\n)"
@@ -141,6 +150,27 @@ def index_sql(schema: TableSchema) -> list[str]:
         cols = ", ".join(f'"{c}"' for c in idx["fields"])
         stmts.append(f'CREATE INDEX IF NOT EXISTS "{idx["key"]}" ON "{schema.table}" ({cols})')
     return stmts
+
+
+def unique_together_sql(table: str, group: dict) -> str:
+    """ADD CONSTRAINT for one unique_together group on an EXISTING table —
+    used when a later migrate adds a group that wasn't there before (a
+    brand-new table gets its groups rendered inline in create_table_sql
+    instead, since CREATE TABLE can just list them as table constraints).
+
+    Unlike index_sql's `CREATE INDEX IF NOT EXISTS`, Postgres has no `ADD
+    CONSTRAINT IF NOT EXISTS` — this always renders the statement
+    unconditionally; psqldb.migrate only calls it for a group
+    psqldb.introspect.constraint_exists() has already confirmed is
+    genuinely new, so idempotency is the caller's job, not this
+    function's (same "renders, never decides" split every other function
+    in this module already follows)."""
+    cols = ", ".join(f'"{c}"' for c in group["fields"])
+    return f'ALTER TABLE "{table}" ADD CONSTRAINT "{group["key"]}" UNIQUE ({cols})'
+
+
+def drop_unique_together_sql(table: str, key: str) -> str:
+    return f'ALTER TABLE "{table}" DROP CONSTRAINT IF EXISTS "{key}"'
 
 
 def trigger_attach_sql(table: str) -> list[str]:
@@ -185,6 +215,19 @@ def trigger_attach_sql(table: str) -> list[str]:
 # every other destructive classification here), so the very next migrate
 # after this upgrade will show a one-time, harmless ALTER COLUMN TYPE
 # review op for each of them even though nothing really changed.
+#
+# The reverse also happens — a column can be REMOVED here without an
+# automatic DROP either. `_field_registry."index"` (a BOOLEAN, meant to
+# flag an indexed field) was dead from the start: registry_upsert_sql never
+# wrote it (its own INSERT column list never named it, so it stayed FALSE
+# forever) and nothing ever read it — named indexes are tracked only as the
+# literal `CREATE INDEX` statements themselves, deliberately never diffed
+# against a registry column (this module's own docstring: index removal is
+# a documented no-op, not a gap). Removed here as dead-code cleanup, not a
+# behavior change; an already-bootstrapped project keeps the orphaned
+# column until an operator runs `ALTER TABLE _field_registry DROP COLUMN
+# "index"` by hand — same one-time-manual-ALTER story as every other
+# _field_registry shape change above, just in the opposite direction.
 # ------------------------------------------------------------------------ #
 BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
     "CREATE EXTENSION IF NOT EXISTS pgcrypto",
@@ -213,7 +256,6 @@ BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
         precision   INTEGER,
         scale       INTEGER,
         reqd        BOOLEAN NOT NULL DEFAULT FALSE,
-        "index"     BOOLEAN NOT NULL DEFAULT FALSE,
         "unique"    BOOLEAN NOT NULL DEFAULT FALSE,
         "default"   TEXT,
         ref_table   TEXT,
@@ -234,6 +276,30 @@ BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
         deleted_by   TEXT,
         deleted_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
         restored_at  TIMESTAMPTZ
+    )
+    """,
+    # -- _unique_together: "the composite-unique groups as of the last
+    # successful migration" — the registry psqldb.migrate diffs a schema's
+    # declared unique_together list against, the same role _field_registry
+    # plays for individual fields. A separate table rather than more
+    # _field_registry columns because a group spans MULTIPLE fields, not
+    # one row per field; `fields` is stored as a real Postgres TEXT[] (not
+    # JSONB) since nothing here ever needs to query inside it, only compare
+    # it whole. Added here rather than via an ALTER on an already-
+    # bootstrapped project (contrast _field_registry's own precision/scale
+    # note above): bootstrap_applied() checks for this table BY NAME, so an
+    # existing project simply re-runs this CREATE TABLE IF NOT EXISTS block
+    # on its very next migrate — no manual ALTER needed, since this is a
+    # whole new table, not a new column on one that already exists.
+    """
+    CREATE TABLE IF NOT EXISTS _unique_together (
+        "table"     TEXT NOT NULL,
+        "key"       TEXT NOT NULL,
+        fields      TEXT[] NOT NULL,
+        plugin      TEXT NOT NULL,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        PRIMARY KEY ("table", "key")
     )
     """,
 ]

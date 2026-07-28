@@ -34,6 +34,32 @@ async def registry_rows(conn: Any, table: str) -> list[dict]:
     return [dict(r) for r in rows]
 
 
+async def unique_together_rows(conn: Any, table: str) -> list[dict]:
+    """Every _unique_together row for `table` — "the composite-unique
+    groups as of the last successful migration", the registry
+    psqldb.migrate diffs a schema's declared groups against, the same role
+    registry_rows() plays for individual fields."""
+    rows = await conn.fetch('select * from _unique_together where "table" = $1', table)
+    return [dict(r) for r in rows]
+
+
+async def constraint_exists(conn: Any, table: str, constraint_name: str) -> bool:
+    """Whether a constraint (of any kind) already exists on `table` under
+    this exact name — used to make adding a unique_together group
+    idempotent. Unlike `CREATE INDEX IF NOT EXISTS`, Postgres has no `ADD
+    CONSTRAINT IF NOT EXISTS`; this is the check psqldb.migrate runs first
+    so a re-migrate with an unchanged group renders no ALTER TABLE at all,
+    rather than one that would fail with a duplicate-constraint error."""
+    row = await conn.fetchval(
+        "select exists(select 1 from pg_constraint c "
+        "join pg_class t on t.oid = c.conrelid "
+        "where t.relname = $1 and c.conname = $2)",
+        table,
+        constraint_name,
+    )
+    return bool(row)
+
+
 async def live_columns(conn: Any, table: str) -> dict[str, dict]:
     """information_schema view of `table`'s actual columns, keyed by column
     name — used only for drift warnings (§ module docstring), never for
@@ -54,7 +80,7 @@ async def bootstrap_applied(conn: Any) -> bool:
     old heuristic treated "_field_registry exists" as "bootstrap fully
     ran". The structural SQL itself is all CREATE ... IF NOT EXISTS, so
     re-running it whenever any one of these is missing is always safe."""
-    for table in ("_field_registry", "_trash", "_patch_history"):
+    for table in ("_field_registry", "_trash", "_patch_history", "_unique_together"):
         if not await table_exists(conn, table):
             return False
     return True

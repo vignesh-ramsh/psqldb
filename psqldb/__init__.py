@@ -894,6 +894,7 @@ class PsqlDbProvider:
             await self.execute(f'DROP FUNCTION IF EXISTS "arc_audit_{plugin}"() CASCADE')
 
         await self.execute('DELETE FROM _field_registry WHERE "table" = ANY($1)', all_tables)
+        await self.execute('DELETE FROM _unique_together WHERE "table" = ANY($1)', all_tables)
         await self.execute('DELETE FROM _patch_history WHERE "table" = ANY($1)', all_tables)
 
         return {"tables": ordered, "audit_table": audit_table, "row_counts": row_counts}

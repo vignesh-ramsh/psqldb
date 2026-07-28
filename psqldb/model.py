@@ -36,6 +36,7 @@ import json
 import re
 from dataclasses import dataclass
 from dataclasses import field as dc_field
+from functools import cached_property
 from pathlib import Path
 
 from . import schema_spec
@@ -151,12 +152,36 @@ class TableSchema:
     # see psqldb.migrate: never creates its table (skip+warn if missing),
     # diffed against ONLY the fields this same plugin already owns on that
     # table (never another plugin's, and never TABLE-typed/child fields)
+    unique_together: list[dict] = dc_field(default_factory=list)  # [{"key": ..., "fields": [...]}, ...] —
+    # a composite (multi-column) natural key, for the shape a single
+    # field's own "unique": true can't express (e.g. one attendance row
+    # per employee PER DAY — neither column alone is unique, only the
+    # pair). Schema-only, like system/audit/child — a patch never creates
+    # a table, so it can't declare the table's own key either
+    # (schema_spec.PatchFileSpec has no such field at all, rejected
+    # structurally). Rendered as a real Postgres UNIQUE constraint and
+    # diffed like one — see psqldb.ddl/psqldb.migrate.
 
     def all_fields(self) -> list[Field]:
         return [*self.system_fields, *self.fields]
 
     def column_fields(self) -> list[Field]:
         return [f for f in self.all_fields() if f.is_column()]
+
+    @cached_property
+    def columns_by_name(self) -> dict[str, Field]:
+        """name -> Field for every real column on this table. Memoized:
+        this exact dict was being rebuilt from scratch on every single
+        query the Query Engine built (relay.query calls this shape in half
+        a dozen places — parse_filters, render_order_by, build_select,
+        build_aggregate — once per call, every time) despite `fields`
+        never changing after boot. Safe to cache on the instance itself
+        because a TableSchema is immutable post-boot (frozen dataclass;
+        psqldb.schema()'s patch-merge path produces a distinct new
+        instance via dataclasses.replace() rather than mutating this one,
+        so a merged schema's cache is never shared with — or stale
+        relative to — its base's)."""
+        return {f.name: f for f in self.column_fields()}
 
     def child_fields(self) -> list[Field]:
         """This table's own TABLE-typed fields — each names a child schema
@@ -213,6 +238,49 @@ def _parse_fields_and_indexes(
     return fields, indexes
 
 
+def _parse_unique_together(
+    raw: dict, path: Path, *, known_columns: set[str]
+) -> list[dict]:
+    """Schema-only (never called for a patch — schema_spec.PatchFileSpec
+    has no such key at all, rejected structurally before this ever runs).
+    Same shape/validation posture as the 'index' entries above, plus a
+    minimum-of-2-fields check: a single-column group is just `"unique":
+    true` on that one field, already covered, and accepting it here too
+    would be two spellings of the same thing with two different
+    diff/rendering paths."""
+    raw_groups = raw.get("unique_together", [])
+    if not isinstance(raw_groups, list):
+        raise SchemaError(f"{path}: 'unique_together' must be a list.")
+    seen_keys: dict[str, int] = {}
+    groups: list[dict] = []
+    for i, ut in enumerate(raw_groups):
+        key = ut.get("key")
+        ut_fields = ut.get("fields")
+        if not key or not isinstance(ut_fields, list) or len(ut_fields) < 2:
+            raise SchemaError(
+                f"{path}: each 'unique_together' entry needs a 'key' and a "
+                f"'fields' list of at least 2 field names — a single field's "
+                f'own "unique": true already covers the one-column case.'
+            )
+        unknown = [f for f in ut_fields if f not in known_columns]
+        if unknown:
+            raise SchemaError(
+                f"{path}: unique_together '{key}' references unknown field(s) {unknown}."
+            )
+        if len(set(ut_fields)) != len(ut_fields):
+            raise SchemaError(
+                f"{path}: unique_together '{key}' lists the same field more than once."
+            )
+        if key in seen_keys:
+            raise SchemaError(
+                f"{path}: unique_together key '{key}' used twice (entry #{seen_keys[key] + 1} "
+                f"and #{i + 1})."
+            )
+        seen_keys[key] = i
+        groups.append({"key": key, "fields": list(ut_fields)})
+    return groups
+
+
 def load_schema_file(path: Path, *, plugin: str) -> TableSchema:
     try:
         raw = json.loads(path.read_text())
@@ -242,24 +310,33 @@ def load_schema_file(path: Path, *, plugin: str) -> TableSchema:
     system_fields = (
         [] if system else (list(CHILD_SYSTEM_FIELDS) if child else list(NORMAL_SYSTEM_FIELDS))
     )
+    known_system_columns = {sf.name for sf in system_fields}
     fields, indexes = _parse_fields_and_indexes(
-        raw, path, table=table, known_system_columns={sf.name for sf in system_fields}
+        raw, path, table=table, known_system_columns=known_system_columns
+    )
+    unique_together = _parse_unique_together(
+        raw, path, known_columns={f.name for f in fields} | known_system_columns
     )
 
     # Every normal (non-system, non-child) table must declare at least one
-    # business unique field of its own. The auto-injected `id` doesn't count
-    # — it's a surrogate key for framework use (FKs, soft-delete/_trash
-    # bookkeeping), never meant to double as a table's real-world identity.
-    # System tables self-declare their own structure entirely (including
-    # whatever they use as a key) and child tables are identified by
-    # (parent, idx), not a key of their own — both exempt.
-    if not system and not child and not any(f.unique for f in fields):
+    # business unique field of its own — a single column, OR a declared
+    # unique_together group (the natural key for the shape a single column
+    # can't express, e.g. one attendance row per employee per day). The
+    # auto-injected `id` doesn't count — it's a surrogate key for framework
+    # use (FKs, soft-delete/_trash bookkeeping), never meant to double as a
+    # table's real-world identity. System tables self-declare their own
+    # structure entirely (including whatever they use as a key) and child
+    # tables are identified by (parent, idx), not a key of their own — both
+    # exempt.
+    if not system and not child and not any(f.unique for f in fields) and not unique_together:
         raise SchemaError(
-            f"{path}: table '{table}' declares no field with \"unique\": true. "
-            f"Every normal table needs at least one business-declared unique "
-            f"field of its own — the framework's auto-generated 'id' doesn't "
-            f"count. Mark whichever field is this table's natural key (e.g. "
-            f'an employee_code, an order number, a slug) as "unique": true.'
+            f"{path}: table '{table}' declares no field with \"unique\": true "
+            f"and no 'unique_together' group. Every normal table needs at "
+            f"least one business-declared unique identity of its own — the "
+            f"framework's auto-generated 'id' doesn't count. Mark whichever "
+            f"field is this table's natural key (e.g. an employee_code, an "
+            f'order number, a slug) as "unique": true, or declare a '
+            f"'unique_together' group if the identity spans more than one field."
         )
 
     # A "system": true table gets no auto-injected id (system_fields is empty
@@ -291,6 +368,7 @@ def load_schema_file(path: Path, *, plugin: str) -> TableSchema:
         fields=fields,
         indexes=indexes,
         system_fields=system_fields,
+        unique_together=unique_together,
     )
 
 

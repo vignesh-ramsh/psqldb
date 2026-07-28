@@ -59,6 +59,20 @@ class IndexSpec(Struct, forbid_unknown_fields=True):
     fields: list[str]
 
 
+class UniqueTogetherSpec(Struct, forbid_unknown_fields=True):
+    """A composite (multi-column) uniqueness constraint — the natural-key
+    shape a single field's own `"unique": true` can't express (e.g. one
+    attendance row per employee PER DAY: neither `employee` nor `date`
+    alone is unique, only the pair). Same {key, fields} shape as
+    IndexSpec on purpose — same authoring convention, different meaning:
+    an index is a performance hint (never auto-dropped, §3.9); this is a
+    real correctness constraint, rendered as a genuine Postgres UNIQUE
+    constraint and diffed like one (psqldb.migrate)."""
+
+    key: str
+    fields: list[str]
+
+
 class FieldSpec(Struct, forbid_unknown_fields=True):
     id: str
     name: str
@@ -96,12 +110,16 @@ class SchemaFileSpec(Struct, forbid_unknown_fields=True):
     child: bool = False
     fields: list[FieldSpec] = []
     index: list[IndexSpec] = []
+    unique_together: list[UniqueTogetherSpec] = []
 
 
 class PatchFileSpec(Struct, forbid_unknown_fields=True):
     """plugins/<plugin>/patches/<Table Name>.json — deliberately has no
     system/audit/child: a patch never creates a table, so those keys never
-    apply here (see module docstring)."""
+    apply here (see module docstring). `unique_together` is schema-only for
+    the same reason — a patch never creates a table, so it can't declare
+    the table's own natural key either; `forbid_unknown_fields=True` above
+    already rejects it here with a clear structural error."""
 
     fields: list[FieldSpec] = []
     index: list[IndexSpec] = []
@@ -136,6 +154,7 @@ __all__ = [
     "IndexSpec",
     "PatchFileSpec",
     "SchemaFileSpec",
+    "UniqueTogetherSpec",
     "patch_schema_json",
     "schema_json",
     "validate_patch_dict",
