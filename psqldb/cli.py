@@ -27,6 +27,7 @@ from urllib.parse import urlparse
 import asyncpg
 import typer
 from rich.console import Console
+from rich.markup import escape
 
 import arc
 from arc.runtime import find_project_root
@@ -200,19 +201,44 @@ def _scope_plan(plan: migrate.MigrationPlan, plugin: str) -> None:
 
 
 def _print_plan(plan: migrate.MigrationPlan) -> None:
-    if plan.is_empty():
-        console.print(
-            "[dim]No schema changes — the live database already matches every registered schema/patch.[/dim]"
-        )
+    """Shows only the REAL diff (Op.maintenance ops — audit-table/index/
+    trigger self-healing, appended unconditionally on every build_plan()
+    call regardless of whether anything changed — are never displayed,
+    though they still execute; see Op.maintenance's own docstring). A
+    project with no genuine schema/patch change prints one line, not the
+    always-present maintenance noise every previous call showed.
+
+    Every piece of DYNAMIC text (table name, op description, the [safe]/
+    [DESTRUCTIVE] tag itself, warnings) goes through rich.markup.escape()
+    — found the hard way while writing this: Rich's markup parser treats
+    ANY lowercase bracketed word as an attempted style name, and silently
+    drops it (bracket text included) when that "style" doesn't resolve —
+    which is exactly what "[safe]" is. `[DESTRUCTIVE]` (uppercase) only
+    ever survived by coincidence, since Rich's own style names are never
+    all-caps, so it doesn't match that lookalike pattern in the first
+    place. Every non-destructive line in this command's entire history
+    has been silently missing its own "[safe]" tag until this fix — and
+    without escaping, a schema/patch file with a literal `[` in a field
+    name or description would have the exact same problem, worse."""
+    real_ops = plan.real_ops()
+    if not real_ops:
+        console.print("[dim]No schema changes to apply.[/dim]")
     else:
-        for table, ops in plan.by_table().items():
-            console.print(f"[bold]{table}[/bold]")
+        by_table: dict[str, list[migrate.Op]] = {}
+        for op in real_ops:
+            by_table.setdefault(op.table, []).append(op)
+        for table, ops in by_table.items():
+            table_style = "bold red" if any(op.destructive for op in ops) else "bold green"
+            console.print(f"[{table_style}]{escape(table)}[/{table_style}]")
             for op in ops:
                 style = "bold red" if op.destructive else "green"
                 tag = "DESTRUCTIVE" if op.destructive else "safe"
-                console.print(f"  [{style}][{tag}][/{style}] ({op.source}) {op.description}")
+                console.print(
+                    f"  [{style}]{escape(f'[{tag}]')}[/{style}] "
+                    f"({escape(op.source)}) {escape(op.description)}"
+                )
     for warning in plan.warnings:
-        console.print(f"[yellow]warning:[/yellow] {warning}")
+        console.print(f"[yellow]warning:[/yellow] {escape(warning)}")
 
 
 SCHEMA_DIR_NAME = "schema"  # under .arc/ — where the generated local JSON Schema files live
@@ -354,10 +380,13 @@ def migrate_(
     are always recoverable from _trash, but are still shown in red."""
     root = _root_or_exit()
 
-    async def _do() -> None:
+    async def _do() -> bool:
         # boot() already ran (arc.runtime.run_async does it before opening
         # psqldb below) — arc.psqldb IS the same provider _boot() used to
-        # return separately.
+        # return separately. Returns whether a REAL migration happened
+        # (False for "nothing to do" or "maintenance ops only") — the
+        # caller uses this to decide whether "Migration complete." is
+        # worth printing at all.
         provider = arc.psqldb
         schemas, patches = provider.schemas(), provider.patches()
         target_plugins = {s.plugin for s in schemas if not plugin or s.plugin == plugin} | {
@@ -376,8 +405,17 @@ def migrate_(
                 if plugin:
                     _scope_plan(the_plan, plugin)  # ops AND schemas — see _scope_plan
                 _print_plan(the_plan)
-                if the_plan.is_empty():
-                    return
+                if not the_plan.has_real_changes():
+                    if not the_plan.is_empty():
+                        # Maintenance ops only (audit table/index/trigger
+                        # self-healing, Op.maintenance's own docstring) —
+                        # still applied, since they're genuinely idempotent
+                        # and this IS what re-establishes something dropped
+                        # by hand, just silently: no confirmation prompt,
+                        # no per-plugin file below, nothing for a human to
+                        # review, because nothing genuinely changed.
+                        await migrate.apply_plan(conn, the_plan, reference=reference)
+                    return False
                 if not yes and not typer.confirm("Proceed?", default=False):
                     console.print("[dim]Aborted — nothing applied.[/dim]")
                     raise typer.Exit(code=1)
@@ -386,15 +424,17 @@ def migrate_(
             plugin_ops_plan = migrate.MigrationPlan(
                 ops=[op for op in the_plan.ops if op.plugin == plugin_name]
             )
-            if plugin_ops_plan.ops:
+            if plugin_ops_plan.has_real_changes():
                 path = migrate.write_migration_file(
                     root / "plugins" / plugin_name, plugin_name, plugin_ops_plan, reference
                 )
                 console.print(f"[dim]wrote {path}[/dim]")
+        return True
 
     with _friendly_errors():
-        arc.runtime.run_async(_do(), open=("psqldb",))
-    console.print("[bold green]Migration complete.[/bold green]")
+        applied = arc.runtime.run_async(_do(), open=("psqldb",))
+    if applied:
+        console.print("[bold green]Migration complete.[/bold green]")
 
 
 app.command(name="migrate")(migrate_)

@@ -97,6 +97,17 @@ class Op:
     sql: list[str]  # statement(s) that implement this op
     destructive: bool = False
     source: OpSource = "schema"
+    # True for exactly 4 append sites in build_plan: the shared trigger-
+    # function CREATE OR REPLACE, "ensure audit table exists", "ensure
+    # index", and "attach audit trigger" — all idempotent SQL, appended
+    # UNCONDITIONALLY on every single build_plan() call regardless of
+    # whether anything actually changed (deliberately: this is the
+    # self-healing mechanism that re-establishes a trigger/index someone
+    # dropped by hand, with no diff needed to detect the drift). Still
+    # always applied — this flag only controls what plan/migrate DISPLAY
+    # and whether is_empty()-for-humans (has_real_changes(), below)
+    # counts them, never whether they run.
+    maintenance: bool = False
 
 
 @dataclass
@@ -121,6 +132,24 @@ class MigrationPlan:
         for op in self.ops:
             out.setdefault(op.table, []).append(op)
         return out
+
+    def real_ops(self) -> list[Op]:
+        """`self.ops` minus the always-present maintenance ops (Op.maintenance's
+        own docstring has the full list) — what a HUMAN should be shown as
+        "the migration," as opposed to what actually gets executed (every op,
+        maintenance included — see is_empty(), still used for that)."""
+        return [op for op in self.ops if not op.maintenance]
+
+    def has_real_changes(self) -> bool:
+        """Unlike is_empty() (used by apply_plan callers to decide whether
+        there's anything to EXECUTE — maintenance ops still count, since
+        they still need to run), this is "is there anything a human should
+        review or be told about" — the plan/migrate CLI's own question.
+        A plan containing ONLY the 4 always-present maintenance ops
+        (nothing genuinely changed) answers False here, even though
+        is_empty() on that same plan is False (there ARE ops — they're
+        just not a real diff)."""
+        return any(not op.maintenance for op in self.ops)
 
     def is_empty(self) -> bool:
         return not self.ops
@@ -829,6 +858,7 @@ async def _diff_table(
             description=f'{schema.table}: ensure index "{idx["key"]}"',
             sql=[stmt],
             destructive=False,
+            maintenance=True,
         )
         for idx, stmt in zip(schema.indexes, ddl.index_sql(schema))
     ]
@@ -991,6 +1021,7 @@ async def build_plan(
             "arc_set_updated_at, arc_soft_delete_to_trash) are current",
             sql=list(ddl.BOOTSTRAP_FUNCTIONS_SQL),
             destructive=False,
+            maintenance=True,
         )
     )
     if not bootstrapped:
@@ -1043,6 +1074,7 @@ async def build_plan(
                     description=f'ensure audit table "_audit_{schema.plugin}" exists',
                     sql=ddl.audit_table_sql(schema.plugin),
                     destructive=False,
+                    maintenance=True,
                 )
             )
             # Only mark a plugin "seen" once its audit table has actually
@@ -1094,6 +1126,7 @@ async def build_plan(
                     description=f"{schema.table}: attach audit trigger",
                     sql=ddl.audit_attach_sql(schema.table, schema.plugin),
                     destructive=False,
+                    maintenance=True,
                 )
             )
 
