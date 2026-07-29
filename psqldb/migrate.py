@@ -320,8 +320,22 @@ def resolve_ref_columns(
         this project would rather fail loudly here than let that surface as
         a raw DB error mid-migrate.
     Callers pass schemas + patches together, same as resolve_ref_targets —
-    a patch can add a new REFERENCE field with its own target_field."""
-    by_stem = {s.source_path.stem: s for s in schemas}
+    a patch can add a new REFERENCE field with its own target_field.
+
+    `fields_by_stem` (not `{stem: schema}`, deliberately): a schema and a
+    patch sharing the same file stem are BOTH present in `schemas` here,
+    and a plain last-one-wins dict keyed by stem would silently pick
+    whichever happened to come later in the list — the patch, in
+    practice, since build_plan always orders `[*schemas, *patches]`. That
+    made a target_field lookup search only the PATCH's own (typically
+    tiny) field list, failing to find a field the real schema declares,
+    with a confusing "does not match any field declared" error — found
+    exactly this way, referencing a patched table's schema-declared field.
+    Accumulating every schema/patch's fields under their shared stem finds
+    a target_field regardless of which file actually declares it."""
+    fields_by_stem: dict[str, list] = {}
+    for s in schemas:
+        fields_by_stem.setdefault(s.source_path.stem, []).extend(s.fields)
     ref_columns: dict[tuple[str, str], "ddl.RefColumn"] = {}
     for s in schemas:
         for f in s.fields:
@@ -333,9 +347,8 @@ def resolve_ref_columns(
                     table=target_table, column="id", sql_type="UUID"
                 )
                 continue
-            target_schema = by_stem[f.target]
             target_field = next(
-                (tf for tf in target_schema.fields if tf.name == f.target_field), None
+                (tf for tf in fields_by_stem.get(f.target, []) if tf.name == f.target_field), None
             )
             if target_field is None:
                 raise MigrationError(
