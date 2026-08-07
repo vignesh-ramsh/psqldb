@@ -18,8 +18,16 @@ This module is Postgres-shaped on purpose (docs/arc.MD §3.4 addendum: psqldb
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
+
+#: lowercase, digits, and _ only, starting with a letter — a field name is
+#: a physical Postgres column identifier. The admin UI's FieldEditor
+#: sanitizes to this same shape live as a user types; this is the defense-
+#: in-depth check for a hand-edited schema/patch JSON file, which bypasses
+#: that UI entirely.
+_NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 
 # "data" was shorthand used in early schema drafts for STRING; accepted as a
 # permanent alias so nothing written that way breaks.
@@ -170,6 +178,11 @@ def parse_field(raw: dict, *, table: str, index: int) -> Field:
     name = raw.get("name")
     if not name or not isinstance(name, str):
         raise FieldError(f"{where} ('{field_id}'): missing required string key 'name'.")
+    if not _NAME_RE.match(name):
+        raise FieldError(
+            f"{where} ('{field_id}'): field name '{name}' is invalid — lowercase letters, "
+            f"digits, and underscore only, starting with a letter (e.g. 'order_date')."
+        )
 
     where = f"schema '{table}', field '{name}' ({field_id})"
     ftype = normalize_type(raw.get("type", ""), where=where)

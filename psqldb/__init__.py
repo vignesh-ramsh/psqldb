@@ -611,14 +611,25 @@ class PsqlDbProvider:
         audited table — only `_trash` recovery doesn't apply."""
         schema = self.schema(table)  # raises SchemaError with a clear message if unknown
         async with self._conn_or(conn) as c:
-            if schema.system:
-                await c.execute(f'DELETE FROM "{table}" WHERE id = $1', id)
-            else:
-                await c.execute(
-                    f'UPDATE "{table}" SET _state = 99, updated_by = $2 WHERE id = $1',
-                    id,
-                    deleted_by,
-                )
+            try:
+                if schema.system:
+                    await c.execute(f'DELETE FROM "{table}" WHERE id = $1', id)
+                else:
+                    # A real DELETE too, once the soft-delete UPDATE above
+                    # sets _state=99 — the arc_soft_delete_to_trash trigger
+                    # (psqldb.ddl) snapshots the row into _trash and then
+                    # physically removes it in the same statement, so a row
+                    # still referenced by another table's plain REFERENCE
+                    # column (not a child/TABLE field, which cascades) can
+                    # raise a FK violation right here — same as insert_many/
+                    # update_many already translate for their own writes.
+                    await c.execute(
+                        f'UPDATE "{table}" SET _state = 99, updated_by = $2 WHERE id = $1',
+                        id,
+                        deleted_by,
+                    )
+            except asyncpg.ForeignKeyViolationError as exc:
+                raise validation.friendly_delete_fk_error(exc, table=table) from exc
 
     # ------------------------------------------------------------------ #
     # Batch primitives — one multi-row SQL statement each, not a Python
@@ -735,13 +746,32 @@ class PsqlDbProvider:
             # string to ::UUID here would fail outright, so REFERENCE columns
             # go through the cross-schema-resolved type instead.
             ref_columns = self.ref_columns()
-            field_types = {
-                f.name: (
-                    ref_columns[(table, f.name)].sql_type if f.type == "REFERENCE" else f.sql_type()
-                )
-                for f in schema.fields
-                if f.is_column()
-            }
+            # schema.all_fields() (system fields + business fields), not just
+            # schema.fields — `columns` can include "updated_by" (added just
+            # above whenever updated_by is not None) or, for a child table, a
+            # caller-supplied "parent"/"idx" (neither is in
+            # _SYSTEM_COLUMN_NAMES, so both pass through as ordinary caller
+            # columns) — all three are system_fields, not schema.fields, and
+            # a lookup miss here is a real KeyError, not a graceful fallback
+            # (confirmed live: bulk-editing rows through admin's Data Browser,
+            # the first real caller to pass updated_by through this path).
+            #
+            # REFERENCE_PK/REFERENCE_UUID (id/parent's own sentinel types,
+            # never real caller-facing "REFERENCE") aren't in fields.py's
+            # _SQL_TEMPLATES at all — f.sql_type() raises KeyError for them
+            # by design (ddl.py renders their DDL specially, by field id, and
+            # never calls sql_type() on them either). "id" itself never
+            # reaches this dict's callers (_SYSTEM_COLUMN_NAMES always strips
+            # it before `columns` is built), but "parent" legitimately can —
+            # both are plain UUID columns, same as ddl.py's own rendering.
+            def _cast_type(f) -> str:
+                if f.type == "REFERENCE":
+                    return ref_columns[(table, f.name)].sql_type
+                if f.type in ("REFERENCE_PK", "REFERENCE_UUID"):
+                    return "UUID"
+                return f.sql_type()
+
+            field_types = {f.name: _cast_type(f) for f in schema.all_fields() if f.is_column()}
             data_columns = ["_row_id", *columns]
             data_casts = ["uuid", *(field_types[col] for col in columns)]
             set_clause = ", ".join(f'"{col}" = data."{col}"' for col in columns)
@@ -775,14 +805,22 @@ class PsqlDbProvider:
             return
         schema = self.schema(table)
         async with self._conn_or(conn) as c:
-            if schema.system:
-                await c.execute(f'DELETE FROM "{table}" WHERE id = ANY($1::uuid[])', ids)
-            else:
-                await c.execute(
-                    f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE id = ANY($2::uuid[])',
-                    deleted_by,
-                    ids,
-                )
+            try:
+                if schema.system:
+                    await c.execute(f'DELETE FROM "{table}" WHERE id = ANY($1::uuid[])', ids)
+                else:
+                    # See soft_delete()'s own comment above — the same
+                    # arc_soft_delete_to_trash trigger can raise a FK
+                    # violation here too, one row still referenced by
+                    # another table's plain REFERENCE column blocking the
+                    # WHOLE batch (same all-or-nothing statement).
+                    await c.execute(
+                        f'UPDATE "{table}" SET _state = 99, updated_by = $1 WHERE id = ANY($2::uuid[])',
+                        deleted_by,
+                        ids,
+                    )
+            except asyncpg.ForeignKeyViolationError as exc:
+                raise validation.friendly_delete_fk_error(exc, table=table) from exc
 
     async def get_many(self, table: str, ids: list[UUID], *, conn: Any = None) -> list[dict]:
         self.schema(table)

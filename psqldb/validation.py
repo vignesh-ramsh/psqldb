@@ -97,6 +97,23 @@ def friendly_fk_error(exc: Exception, *, table: str) -> ValidationError:
     return ValidationError(f"'{table}': {detail}")
 
 
+def friendly_delete_fk_error(exc: Exception, *, table: str) -> ValidationError:
+    """Translates asyncpg's ForeignKeyViolationError raised while DELETING
+    from `table` (a real DELETE, or the arc_soft_delete_to_trash trigger's
+    own internal DELETE once a soft-delete sets _state=99) — deliberately
+    NOT friendly_fk_error above: that one's "{table}_{column}_fkey" naming
+    convention finds the constraint ON `table` itself (an insert/update
+    whose OWN column points at something missing); here the constraint
+    lives on the OTHER, referencING table (some other row still points AT
+    this one), so the same naming guess would either miss entirely or —
+    worse — name the wrong field with the wrong ("references a row that
+    doesn't exist") direction. Postgres's own `detail` ("Key (x)=(y) is
+    still referenced from table \"...\"") already says exactly what
+    happened; this just frames it instead of trying to out-guess it."""
+    detail = getattr(exc, "detail", None) or str(exc)
+    return ValidationError(f"'{table}': can't delete — {detail}")
+
+
 def friendly_unique_error(exc: Exception, *, table: str) -> ValidationError:
     """Translates asyncpg's UniqueViolationError the same way
     friendly_fk_error (above) translates a FK violation — a `"unique": true`
