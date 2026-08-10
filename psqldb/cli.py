@@ -273,9 +273,8 @@ def check(
     total = 0
     problems: list[tuple[str, str]] = []
     for m in manifests:
-        pkg_dir = m.source_dir / m.name
         for loader, subdir in ((load_schemas_dir, "schemas"), (load_patches_dir, "patches")):
-            d = pkg_dir / subdir
+            d = m.source_dir / subdir
             if not d.exists() or not any(d.glob("*.json")):
                 continue
             try:
