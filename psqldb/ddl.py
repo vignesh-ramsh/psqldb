@@ -423,6 +423,17 @@ def audit_table_sql(plugin: str) -> list[str]:
             changed_at  TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """,
+        # admin.audit_api.list_audit_entries's real query shape: WHERE
+        # row_id = $1 ORDER BY id DESC LIMIT $2 (id, not changed_at — id
+        # is UUIDv7, arc_uuid_generate_v7() above, already chronological).
+        # Without this, that query is a full seq scan of the whole audit
+        # table on every "Row Preview" open, and only gets worse as it
+        # grows — this table has no TableSchema so it never goes through
+        # the normal patches/index mechanism; IF NOT EXISTS + re-run on
+        # every migrate (maintenance=True in migrate.py) is how an
+        # already-existing "_audit_{plugin}" table picks this up too, not
+        # just a freshly created one.
+        f'CREATE INDEX IF NOT EXISTS "idx_audit_{plugin}_row_id" ON "{table}" (row_id, id DESC)',
         f"""
         CREATE OR REPLACE FUNCTION arc_audit_{plugin}() RETURNS trigger AS $$
         DECLARE
