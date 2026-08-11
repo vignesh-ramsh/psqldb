@@ -29,7 +29,19 @@ async def table_exists(conn: Any, table: str) -> bool:
 
 async def registry_rows(conn: Any, table: str) -> list[dict]:
     """Every _field_registry row for `table`, keyed by field id — this is
-    "the schema as of the last successful migration"."""
+    "the schema as of the last successful migration". On a genuinely
+    fresh database, _field_registry itself doesn't exist yet — build_plan
+    only QUEUES the bootstrap SQL as a plan op, it never applies it (pure
+    planning, see migrate.build_plan's own docstring) — which a plain
+    query here would hit as UndefinedTableError the moment a patch's
+    target table is in build_plan's `will_exist` set (about to be
+    created by its own plugin's schema in this same pass) rather than
+    already physically existing. No registry table means no prior
+    registration, by definition, so that's exactly the right answer
+    here too — same reasoning table_exists() already gets right via
+    information_schema, which always exists."""
+    if not await table_exists(conn, "_field_registry"):
+        return []
     rows = await conn.fetch('select * from _field_registry where "table" = $1', table)
     return [dict(r) for r in rows]
 
@@ -38,7 +50,11 @@ async def unique_together_rows(conn: Any, table: str) -> list[dict]:
     """Every _unique_together row for `table` — "the composite-unique
     groups as of the last successful migration", the registry
     psqldb.migrate diffs a schema's declared groups against, the same role
-    registry_rows() plays for individual fields."""
+    registry_rows() plays for individual fields. Same not-bootstrapped-yet
+    guard as registry_rows() and for the identical reason — see that
+    function's own docstring."""
+    if not await table_exists(conn, "_unique_together"):
+        return []
     rows = await conn.fetch('select * from _unique_together where "table" = $1', table)
     return [dict(r) for r in rows]
 
