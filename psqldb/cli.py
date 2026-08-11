@@ -22,7 +22,7 @@ import subprocess
 import time
 import warnings
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import asyncpg
 import typer
@@ -59,6 +59,75 @@ def _dsn() -> str:
         )
         raise typer.Exit(code=1)
     return dsn
+
+
+@app.command()
+def setup() -> None:
+    """Interactively configure the Postgres connection (host/port/database/
+    user/password), validating connectivity before saving — the guided
+    alternative to hand-composing a DSN for `arc settings set psqldb_dsn
+    ... --secret`. Safe to re-run: asks before overwriting an existing
+    psqldb_dsn, showing what it would replace."""
+    root = find_project_root()
+    if root is None:
+        err_console.print(
+            "Not inside an ARC project (no .arc/arc.toml found here or in any parent)."
+        )
+        raise typer.Exit(code=1)
+
+    mgr = SettingsManager(root / ".arc")
+    existing = mgr.get(DSN_KEY, reveal=True)
+    if existing is not None:
+        parsed_existing = urlparse(existing)
+        console.print(
+            f"[yellow]psqldb_dsn is already set[/yellow] "
+            f"({parsed_existing.hostname}:{parsed_existing.port or 5432}"
+            f"/{parsed_existing.path.lstrip('/')})."
+        )
+        if not typer.confirm("Reconfigure it?", default=False):
+            console.print("[dim]Aborted — nothing changed.[/dim]")
+            raise typer.Exit(code=1)
+
+    host = typer.prompt("Host", default="localhost")
+    port = typer.prompt("Port", default=5432, type=int)
+    database = typer.prompt("Database name")
+    user = typer.prompt("User")
+    # default="" (not omitted) — Click's prompt() re-prompts forever on
+    # empty input when no default is set at all, which would make a
+    # genuinely passwordless (trust-auth) local Postgres role impossible
+    # to configure through this command.
+    password = typer.prompt(
+        "Password (blank for none)", default="", show_default=False, hide_input=True
+    )
+
+    # quote_plus so a special character in user/password (@, :, /, ...)
+    # can't be misparsed as DSN structure by urlparse/asyncpg.
+    auth = quote_plus(user)
+    if password:
+        auth += f":{quote_plus(password)}"
+    dsn = f"postgresql://{auth}@{host}:{port}/{database}"
+
+    async def _check() -> str:
+        conn = await asyncpg.connect(dsn, timeout=5)
+        try:
+            return await conn.fetchval("select version()")
+        finally:
+            await conn.close()
+
+    console.print(f"Connecting to {host}:{port}/{database}...")
+    try:
+        version = asyncio.run(_check())
+    except Exception as exc:
+        err_console.print(f"FAILED to connect: {exc}")
+        console.print("[dim]Nothing saved — run `arc psqldb setup` again to retry.[/dim]")
+        raise typer.Exit(code=1)
+
+    mgr.set(DSN_KEY, dsn, secret=True)
+    console.print(f"[bold green]Connected[/bold green] — {version}")
+    console.print(f"[dim]Saved to {DSN_KEY} (encrypted, .arc/arc.secrets).[/dim]")
+    console.print(
+        "[dim]Next: `arc psqldb migrate` to create tables in this database.[/dim]"
+    )
 
 
 @app.command()
