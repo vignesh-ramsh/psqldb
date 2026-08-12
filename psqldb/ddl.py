@@ -440,15 +440,20 @@ def audit_table_sql(plugin: str) -> list[str]:
             new_json jsonb := to_jsonb(NEW);
             old_json jsonb := to_jsonb(OLD);
         BEGIN
-            -- A genuinely no-op UPDATE (every column identical) writes no
-            -- audit row at all — arc_set_updated_at (a BEFORE trigger,
-            -- always fires first) already leaves updated_at itself
-            -- untouched in that same case, so old_json = new_json here
-            -- means the whole row, updated_at included, is unchanged. Only
-            -- applies to UPDATE: an INSERT/DELETE is never a "no-op" by
-            -- definition (the row didn't exist a moment ago, or won't a
-            -- moment from now), so both are always recorded regardless.
-            IF TG_OP = 'UPDATE' AND old_json = new_json THEN
+            -- INSERT writes no audit row at all — a product decision (not
+            -- the original "INSERT is never a no-op" reasoning this
+            -- function used to state, which was true but beside the
+            -- point): a row's creation is already on the row itself
+            -- (created_by/created_at), and the audit trail is meant to
+            -- start once something is actually CHANGED, not restate the
+            -- row's own first values back at it. A genuinely no-op UPDATE
+            -- (every column identical) also writes nothing — arc_set_
+            -- updated_at (a BEFORE trigger, always fires first) already
+            -- leaves updated_at itself untouched in that same case, so
+            -- old_json = new_json here means the whole row, updated_at
+            -- included, is unchanged. DELETE has no such thing as a
+            -- no-op — always recorded.
+            IF TG_OP = 'INSERT' OR (TG_OP = 'UPDATE' AND old_json = new_json) THEN
                 RETURN NEW;
             END IF;
 
@@ -460,17 +465,19 @@ def audit_table_sql(plugin: str) -> list[str]:
             -- jsonb degrades to NULL when the key's absent instead of raising
             -- "record has no field", so this works for both table shapes
             -- without the function needing to know which one it's on.
+            --
+            -- 'before' is always old_json, unconditionally, now that INSERT
+            -- returns above before ever reaching this statement — only
+            -- UPDATE (a real change) and DELETE still get here, and both
+            -- always have a real OLD row.
             INSERT INTO "{table}" ("table", row_id, changes, changed_by)
             VALUES (
                 TG_TABLE_NAME,
                 COALESCE(NEW.id, OLD.id),
                 jsonb_build_object(
-                    'before', CASE WHEN TG_OP = 'INSERT' THEN NULL ELSE old_json END,
+                    'before', old_json,
                     'after',  CASE WHEN TG_OP = 'DELETE' THEN NULL ELSE new_json END
                 ),
-                -- updated_by first (an UPDATE's actor), then created_by (an
-                -- INSERT sets only created_by, so audit rows for inserts used
-                -- to record NULL — the row's creator was never captured).
                 COALESCE(
                     new_json->>'updated_by', new_json->>'created_by',
                     old_json->>'updated_by', old_json->>'created_by'
