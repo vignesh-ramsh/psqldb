@@ -75,6 +75,28 @@ def _as_dicts(records: list[asyncpg.Record]) -> list[dict]:
     return [dict(r) for r in records]
 
 
+# asyncpg hard-caps a single prepared statement at 32767 bind parameters
+# (a wire-protocol limit, not configurable) — insert_many/update_many each
+# bind every row's own values as individual positional parameters in ONE
+# statement, so a WIDE table hits this at a much smaller ROW count than
+# "bulk" would suggest (a 90-column table: ~360 rows). Found by a real
+# crash benchmarking relay.save_many() at 20k rows on a 5-column table
+# (`the number of query arguments cannot exceed 32767`). A little under
+# the true ceiling, not flush against it, purely for headroom.
+_MAX_BIND_PARAMS = 32_000
+
+
+def _chunk_rows(rows: list, params_per_row: int) -> list[list]:
+    """Splits `rows` into groups that each stay under _MAX_BIND_PARAMS once
+    multiplied by `params_per_row` — insert_many/update_many run one SQL
+    statement per group instead of one for the whole call, transparently:
+    a caller never needs to know this limit exists, or compute chunk sizes
+    itself. `params_per_row` is always >= 1 by the time either caller
+    reaches this (a homogeneous row always has at least one column)."""
+    chunk_size = max(1, _MAX_BIND_PARAMS // params_per_row)
+    return [rows[i : i + chunk_size] for i in range(0, len(rows), chunk_size)]
+
+
 class PsqlDbProvider:
     """Thin asyncpg wrapper: a pool, the schema/migration system
     (register_model/plan/migrate), and the small set of CRUD primitives
@@ -682,18 +704,35 @@ class PsqlDbProvider:
 
         async with self._conn_or(conn) as c:
             col_list = ", ".join(f'"{col}"' for col in columns)
-            value_rows, params, pi = [], [], 1
-            for clean in cleaned:
-                value_rows.append(f"({', '.join(f'${pi + j}' for j in range(len(columns)))})")
-                params.extend(clean[col] for col in columns)
-                pi += len(columns)
-            query = f'INSERT INTO "{table}" ({col_list}) VALUES {", ".join(value_rows)} RETURNING *'
-            try:
-                return _as_dicts(await c.fetch(query, *params))
-            except asyncpg.ForeignKeyViolationError as exc:
-                raise validation.friendly_fk_error(exc, table=table) from exc
-            except asyncpg.UniqueViolationError as exc:
-                raise validation.friendly_unique_error(exc, table=table) from exc
+            # c.transaction() nested inside a caller's own (Relay's
+            # _write_transaction, when `conn` was given) becomes a real
+            # SAVEPOINT, not a second transaction — same asyncpg behavior
+            # relay/__init__.py's own module docstring already relies on.
+            # Called directly with conn=None, this IS the only transaction
+            # guarding the batch, restoring the single-statement version's
+            # implicit all-or-nothing guarantee across however many chunks
+            # _chunk_rows produces.
+            async with c.transaction():
+                results: list[dict] = []
+                try:
+                    for chunk in _chunk_rows(cleaned, len(columns)):
+                        value_rows, params, pi = [], [], 1
+                        for clean in chunk:
+                            value_rows.append(
+                                f"({', '.join(f'${pi + j}' for j in range(len(columns)))})"
+                            )
+                            params.extend(clean[col] for col in columns)
+                            pi += len(columns)
+                        query = (
+                            f'INSERT INTO "{table}" ({col_list}) VALUES {", ".join(value_rows)} '
+                            f"RETURNING *"
+                        )
+                        results.extend(_as_dicts(await c.fetch(query, *params)))
+                except asyncpg.ForeignKeyViolationError as exc:
+                    raise validation.friendly_fk_error(exc, table=table) from exc
+                except asyncpg.UniqueViolationError as exc:
+                    raise validation.friendly_unique_error(exc, table=table) from exc
+                return results
 
     async def update_many(
         self,
@@ -776,27 +815,36 @@ class PsqlDbProvider:
             data_casts = ["uuid", *(field_types[col] for col in columns)]
             set_clause = ", ".join(f'"{col}" = data."{col}"' for col in columns)
             data_col_list = ", ".join(f'"{col}"' for col in data_columns)
-            value_rows, params, pi = [], [], 1
-            for row_id, clean in zip(ids, cleaned):
-                values = [row_id, *(clean[col] for col in columns)]
-                value_rows.append(
-                    "("
-                    + ", ".join(f"${pi + j}::{data_casts[j]}" for j in range(len(data_columns)))
-                    + ")"
-                )
-                params.extend(values)
-                pi += len(data_columns)
-            query = (
-                f'UPDATE "{table}" SET {set_clause} '
-                f"FROM (VALUES {', '.join(value_rows)}) AS data({data_col_list}) "
-                f'WHERE "{table}".id = data._row_id RETURNING "{table}".*'
-            )
-            try:
-                return _as_dicts(await c.fetch(query, *params))
-            except asyncpg.ForeignKeyViolationError as exc:
-                raise validation.friendly_fk_error(exc, table=table) from exc
-            except asyncpg.UniqueViolationError as exc:
-                raise validation.friendly_unique_error(exc, table=table) from exc
+            # See insert_many's own comment on c.transaction() here — same
+            # savepoint-when-nested, real-transaction-when-standalone
+            # reasoning, needed here for the exact same _chunk_rows() split.
+            async with c.transaction():
+                results: list[dict] = []
+                try:
+                    for chunk in _chunk_rows(list(zip(ids, cleaned)), len(data_columns)):
+                        value_rows, params, pi = [], [], 1
+                        for row_id, clean in chunk:
+                            values = [row_id, *(clean[col] for col in columns)]
+                            value_rows.append(
+                                "("
+                                + ", ".join(
+                                    f"${pi + j}::{data_casts[j]}" for j in range(len(data_columns))
+                                )
+                                + ")"
+                            )
+                            params.extend(values)
+                            pi += len(data_columns)
+                        query = (
+                            f'UPDATE "{table}" SET {set_clause} '
+                            f"FROM (VALUES {', '.join(value_rows)}) AS data({data_col_list}) "
+                            f'WHERE "{table}".id = data._row_id RETURNING "{table}".*'
+                        )
+                        results.extend(_as_dicts(await c.fetch(query, *params)))
+                except asyncpg.ForeignKeyViolationError as exc:
+                    raise validation.friendly_fk_error(exc, table=table) from exc
+                except asyncpg.UniqueViolationError as exc:
+                    raise validation.friendly_unique_error(exc, table=table) from exc
+                return results
 
     async def soft_delete_many(
         self, table: str, ids: list[UUID], *, deleted_by: str | None = None, conn: Any = None
