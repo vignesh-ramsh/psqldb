@@ -100,6 +100,7 @@ class FieldSpec(Struct, forbid_unknown_fields=True):
     options: list[str] | None = None
     target: str | None = None
     target_field: str | None = None
+    group: str | None = None  # UI-only Row Editor section hint — see Field.group (psqldb.fields)
 
 
 class SchemaFileSpec(Struct, forbid_unknown_fields=True):

@@ -123,6 +123,12 @@ class Field:
     # unless a plugin explicitly opts a field OUT (e.g. a
     # verbose JSON/MULTIFILE blob that's fine in the row
     # editor but clutters a table view of many rows).
+    group: str | None = None  # UI-only, same posture as `list` above — never read
+    # by psqldb.ddl, purely a hint for admin's Row Editor
+    # to section a long field list (docs/admin-ui-ux-review.md,
+    # the same gap already named at §3.2/§7.1). None means
+    # "ungrouped" — a schema that never sets this renders
+    # exactly as before, one flat list, no section headers.
     target: str | None = None  # REFERENCE / TABLE only — table this points to
     target_field: str | None = None  # REFERENCE only — which field on `target` this
     # points at. None = the implicit PK ("id") — the
@@ -191,6 +197,9 @@ def parse_field(raw: dict, *, table: str, index: int) -> Field:
     unique = bool(raw.get("unique", False))
     primary_key = bool(raw.get("primary_key", False))
     list_in_view = bool(raw.get("list", True))
+    group = raw.get("group")
+    if group is not None and (not isinstance(group, str) or not group.strip()):
+        raise FieldError(f"{where}: 'group', when given, must be a non-empty string.")
     length = raw.get("length")
     precision = raw.get("precision")
     scale = raw.get("scale")
@@ -248,4 +257,5 @@ def parse_field(raw: dict, *, table: str, index: int) -> Field:
         target=target,
         target_field=target_field,
         list=list_in_view,
+        group=group,
     )
