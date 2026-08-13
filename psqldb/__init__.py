@@ -47,6 +47,8 @@ POOL_MIN_SIZE_KEY = "psqldb_pool_min_size"
 POOL_MAX_SIZE_KEY = "psqldb_pool_max_size"
 SLOW_QUERY_THRESHOLD_MS_KEY = "psqldb_slow_query_threshold_ms"
 STATEMENT_TIMEOUT_MS_KEY = "psqldb_statement_timeout_ms"
+POOL_ACQUIRE_TIMEOUT_MS_KEY = "psqldb_pool_acquire_timeout_ms"
+IDLE_IN_TRANSACTION_TIMEOUT_MS_KEY = "psqldb_idle_in_transaction_timeout_ms"
 
 _logger = logging.getLogger("psqldb")
 
@@ -112,6 +114,8 @@ class PsqlDbProvider:
         *,
         slow_query_threshold_ms: int = 0,
         statement_timeout_ms: int = 30_000,
+        pool_acquire_timeout_ms: int = 10_000,
+        idle_in_transaction_timeout_ms: int = 60_000,
     ) -> None:
         self._kernel = kernel
         self.dsn = dsn
@@ -121,6 +125,8 @@ class PsqlDbProvider:
         # sentinel someone has to already know about.
         self.slow_query_threshold_ms = slow_query_threshold_ms
         self.statement_timeout_ms = statement_timeout_ms
+        self.pool_acquire_timeout_ms = pool_acquire_timeout_ms
+        self.idle_in_transaction_timeout_ms = idle_in_transaction_timeout_ms
         self._pool: asyncpg.Pool | None = None
         self._schemas: list[TableSchema] = []
         self._by_table: dict[str, TableSchema] = {}
@@ -425,7 +431,11 @@ class PsqlDbProvider:
 
         Also applies `statement_timeout` (psqldb_statement_timeout_ms,
         default 30s) so one runaway query can't hold a connection (and
-        whatever locks it's taken) forever, and — if
+        whatever locks it's taken) forever; `idle_in_transaction_session_timeout`
+        (psqldb_idle_in_transaction_timeout_ms, default 60s) so an open-but-
+        idle transaction (an abandoned BEGIN, a hung task) can't do the same
+        thing for a different reason — no query running, just never
+        committed or rolled back; and — if
         psqldb_slow_query_threshold_ms is set above 0 — registers a slow-
         query logger via asyncpg's own `add_query_logger` (its official
         instrumentation hook, not a hand-rolled wrapper around every CRUD
@@ -442,17 +452,15 @@ class PsqlDbProvider:
             await conn.set_type_codec(
                 "json", encoder=_encode_json, decoder=arc.codec.decode, schema="pg_catalog"
             )
-            # set_config (not a raw `SET ... = '<value>'` string) for both
-            # of these so the configured value is always a real bound
-            # parameter, never interpolated into SQL text.
             await conn.execute(
                 "SELECT set_config('TimeZone', $1, false)", str(arc.tz.server_timezone())
             )
-            if self.statement_timeout_ms > 0:
-                await conn.execute(
-                    "SELECT set_config('statement_timeout', $1, false)",
-                    str(self.statement_timeout_ms),
-                )
+            # statement_timeout/idle_in_transaction_session_timeout are
+            # DELIBERATELY NOT set here — see acquire()'s own docstring
+            # below for why applying them once, at physical-connection-
+            # creation time (this callback's only ever called once per
+            # connection, not per checkout), turned out to be a real,
+            # severe bug found by this project's own failure-mode audit.
             if self.slow_query_threshold_ms > 0:
                 conn.add_query_logger(self._log_slow_query)
 
@@ -485,13 +493,72 @@ class PsqlDbProvider:
             self._pool = None
 
     def acquire(self):
-        """`async with arc.psqldb.acquire() as conn:` — one pooled connection."""
+        """`async with arc.psqldb.acquire() as conn:` — one pooled connection.
+
+        Bounded by `psqldb_pool_acquire_timeout_ms` (default 10s, 0
+        disables it) — asyncpg's own `Pool.acquire()` default is an
+        UNBOUNDED wait, which turns ordinary pool contention into a
+        silent, permanent hang the instant demand exceeds supply, rather
+        than a clear, timely error. This matters most for a caller doing
+        `new_transaction=True` from inside a hook that's already holding
+        one connection: if enough concurrent callers do this at once and
+        the pool is smaller than 2x that concurrency, every one of them
+        ends up holding one connection while waiting forever for a second
+        one only another equally-stuck caller could free — a genuine
+        circular-wait deadlock, confirmed via a real two-connection
+        reproduction (2 concurrent outer writes, each with a
+        new_transaction=True nested write, against a pool of exactly 2:
+        both hang indefinitely with no timeout). A bounded acquire turns
+        that permanent hang into a raised `asyncio.TimeoutError` within a
+        few seconds — still a failure, but a caller (or its own HTTP
+        client) can retry or surface it, instead of a coroutine (and the
+        connection it's already holding) stuck forever.
+
+        Also (re-)applies statement_timeout/idle_in_transaction_session_timeout
+        on EVERY checkout, not once at physical-connection-creation time —
+        found by this project's own failure-mode audit to be the actual
+        fix a real bug needed, not a style choice. Setting these once in
+        the pool's own `init=` callback (asyncpg's `create_pool`, which
+        fires exactly once per physical connection, not per checkout)
+        reads back correctly from `SHOW statement_timeout` forever after —
+        but silently stops being ENFORCED the moment the connection has
+        been through one checkout/release cycle that included a write:
+        confirmed with a minimal, Arc-independent reproduction (a bare
+        asyncpg pool, an `init=` callback doing nothing but `SET
+        statement_timeout = 500`, one acquire to CREATE TABLE, a second
+        acquire to INSERT + `pg_sleep(2)` inside one transaction — the
+        sleep ran to completion every time, despite `SHOW
+        statement_timeout` correctly reporting 500ms throughout). Setting
+        it fresh on every acquire — the one pattern confirmed to work
+        reliably across repeated checkouts — costs one extra fast
+        round-trip per acquire, which is a genuinely small price for a
+        timeout that actually times out."""
         if self._pool is None:
             raise RuntimeError(
                 "psqldb pool is not open — call `await arc.psqldb.open()` "
                 "during your application's startup first."
             )
-        return self._pool.acquire()
+        timeout = self.pool_acquire_timeout_ms / 1000 if self.pool_acquire_timeout_ms > 0 else None
+        return self._acquire_cm(timeout)
+
+    @contextlib.asynccontextmanager
+    async def _acquire_cm(self, timeout: float | None):
+        async with self._pool.acquire(timeout=timeout) as conn:
+            # Plain `SET`, not `set_config()` — see this method's own
+            # docstring for why that distinction, on its own, does NOT fix
+            # the underlying bug (both were tried; only re-applying on
+            # every acquire actually did). Safe without bind-parameter
+            # support (a `SET` utility statement doesn't accept `$1` for
+            # its value) only because both values are guaranteed real ints
+            # (arc.settings' own `type=int` declaration) validated `> 0`
+            # first — never user input, never string-interpolated.
+            if self.statement_timeout_ms > 0:
+                await conn.execute(f"SET statement_timeout = {int(self.statement_timeout_ms)}")
+            if self.idle_in_transaction_timeout_ms > 0:
+                await conn.execute(
+                    f"SET idle_in_transaction_session_timeout = {int(self.idle_in_transaction_timeout_ms)}"
+                )
+            yield conn
 
     async def execute(self, query: str, *params: Any) -> str:
         async with self.acquire() as conn:
@@ -1037,6 +1104,23 @@ def register(kernel: Any) -> None:
         default=30_000,
         doc="Postgres statement_timeout applied to every pooled connection, in milliseconds. 0 disables it.",
     )
+    kernel.settings.declare(
+        POOL_ACQUIRE_TIMEOUT_MS_KEY,
+        type=int,
+        default=10_000,
+        doc="Maximum time to wait for a connection to free up from the pool, in "
+        "milliseconds, before raising asyncio.TimeoutError instead of waiting "
+        "forever. 0 disables it (asyncpg's own default: wait indefinitely).",
+    )
+    kernel.settings.declare(
+        IDLE_IN_TRANSACTION_TIMEOUT_MS_KEY,
+        type=int,
+        default=60_000,
+        doc="Postgres idle_in_transaction_session_timeout applied to every pooled "
+        "connection, in milliseconds — kills a transaction that's open but not "
+        "actively running a statement (an abandoned BEGIN, a hung task) instead "
+        "of letting it hold its connection and locks forever. 0 disables it.",
+    )
 
     dsn = kernel.settings.get(DSN_KEY, reveal=True)
     if dsn is None:
@@ -1049,6 +1133,8 @@ def register(kernel: Any) -> None:
     max_size = kernel.settings.get(POOL_MAX_SIZE_KEY)
     slow_query_threshold_ms = kernel.settings.get(SLOW_QUERY_THRESHOLD_MS_KEY)
     statement_timeout_ms = kernel.settings.get(STATEMENT_TIMEOUT_MS_KEY)
+    pool_acquire_timeout_ms = kernel.settings.get(POOL_ACQUIRE_TIMEOUT_MS_KEY)
+    idle_in_transaction_timeout_ms = kernel.settings.get(IDLE_IN_TRANSACTION_TIMEOUT_MS_KEY)
 
     provider = PsqlDbProvider(
         kernel,
@@ -1057,6 +1143,8 @@ def register(kernel: Any) -> None:
         max_size=max_size,
         slow_query_threshold_ms=slow_query_threshold_ms,
         statement_timeout_ms=statement_timeout_ms,
+        pool_acquire_timeout_ms=pool_acquire_timeout_ms,
+        idle_in_transaction_timeout_ms=idle_in_transaction_timeout_ms,
     )
     kernel.export(CAPABILITY, provider, requires=[], optional_requires=[])
     # system.reload -> full re-scan of every registered schemas/patches
