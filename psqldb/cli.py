@@ -706,7 +706,11 @@ def trash_recover(
     ),
 ) -> None:
     """Recover a _trash entry: Row/Table entries are re-inserted as-is;
-    Column entries update just that one column back onto its original row."""
+    a Column entry's snapshot is a jsonb ARRAY covering up to
+    psqldb.migrate.COLUMN_DROP_CHUNK_SIZE rows (one _trash entry = one
+    chunk of the dropped column, not one row) — recovering it updates
+    every row in that chunk back onto its original row in one set-based
+    UPDATE, not just a single row."""
     dsn = _dsn()
 
     async def _run():
@@ -743,15 +747,23 @@ def trash_recover(
                     snapshot_text,
                 )
             else:  # Column
+                # snapshot is a jsonb ARRAY of {"_row_id": ..., "<col>": ...}
+                # objects (one per row in this chunk) — jsonb_array_elements
+                # unpacks it back into one row per element, and
+                # jsonb_populate_record infers "col"'s real type from the
+                # table's own (by-now re-added) column, same trick the
+                # Row/Table branch above uses. _row_id has no matching
+                # column on this table (the real PK is "id"), so it's
+                # pulled out directly via ->> rather than through
+                # jsonb_populate_record, which would just silently drop it.
                 snapshot = json.loads(snapshot_text)
-                row_id = snapshot["_row_id"]
-                col = next(k for k in snapshot if k != "_row_id")
+                col = next(k for k in snapshot[0] if k != "_row_id")
                 await conn.execute(
-                    f'UPDATE "{table}" t SET "{col}" = x."{col}" '
-                    f'FROM jsonb_populate_record(null::"{table}", $1::jsonb) AS x '
-                    f"WHERE t.id = $2",
+                    f'UPDATE "{table}" t '
+                    f'SET "{col}" = (jsonb_populate_record(null::"{table}", elem))."{col}" '
+                    f"FROM jsonb_array_elements($1::jsonb) AS elem "
+                    f"WHERE t.id = (elem->>'_row_id')::uuid",
                     snapshot_text,
-                    row_id,
                 )
 
             await conn.execute("UPDATE _trash SET restored_at = now() WHERE id = $1", trash_id)

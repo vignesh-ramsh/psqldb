@@ -965,18 +965,45 @@ def _column_def(
     return _user_column_sql(f, owner_table=owner_table, ref_columns=ref_columns)
 
 
+#: Every existing row's value for a dropped column is snapshotted into
+#: _trash in groups of this many rows per _trash entry, not one _trash row
+#: per table row — see _drop_column_op's own docstring for why an
+#: unchunked design (one row, or one row-per-table-row) doesn't work here.
+COLUMN_DROP_CHUNK_SIZE = 10_000
+
+
 def _drop_column_op(schema: TableSchema, prev: dict, *, source: OpSource) -> Op:
     """Every existing row's value for this column is snapshotted into
-    _trash (one _trash row per table row, single set-based INSERT — not a
-    per-row Python loop) BEFORE the column is actually dropped. Reached
-    both when a schema removes a field it owns and when a patch removes a
-    field it previously added — identical treatment either way."""
+    _trash BEFORE the column is actually dropped — chunked into groups of
+    COLUMN_DROP_CHUNK_SIZE rows per _trash entry (one jsonb ARRAY of
+    {"_row_id": ..., "<col>": ...} objects per chunk), single set-based
+    INSERT, not a per-row Python loop.
+
+    Two unchunked designs were considered and rejected first: one _trash
+    row per table row (the original design — floods _trash with millions
+    of one-value rows on a large table) and one _trash row for the WHOLE
+    column (a single jsonb array covering every row). The second one hits
+    a real, hard Postgres ceiling most people don't know about: jsonb's
+    on-disk format encodes each element's offset/length in 28 bits
+    (JENTRY_OFFLENMASK), capping any single jsonb VALUE at 268,435,455
+    bytes (~256MB) — independent of, and far tighter than, the general
+    1GB TOAST limit other varlena types get. A wide dropped column (a
+    TEXT/JSON field, not a short string) on a large table blows past that
+    and fails the migration outright, mid-DROP-COLUMN. Chunking bounds the
+    worst case per _trash row to COLUMN_DROP_CHUNK_SIZE regardless of
+    table size or column width, while still cutting a million-row drop
+    from a million _trash rows down to ~100.
+
+    Reached both when a schema removes a field it owns and when a patch
+    removes a field it previously added — identical treatment either way."""
     col = prev["name"]
     snapshot_sql = (
         f'INSERT INTO _trash ("table", drop_type, snapshot, deleted_at) '
         f"SELECT '{_q(schema.table)}', 'Column', "
-        f"jsonb_build_object('_row_id', id, '{_q(col)}', \"{col}\"), now() "
-        f'FROM "{schema.table}"'
+        f"jsonb_agg(jsonb_build_object('_row_id', id, '{_q(col)}', \"{col}\") ORDER BY id), now() "
+        f'FROM (SELECT id, "{col}", (row_number() OVER (ORDER BY id) - 1) / {COLUMN_DROP_CHUNK_SIZE} AS chunk '
+        f'FROM "{schema.table}") _chunked '
+        f"GROUP BY chunk"
     )
     drop_sql = f'ALTER TABLE "{schema.table}" DROP COLUMN "{col}"'
     return Op(
@@ -984,7 +1011,10 @@ def _drop_column_op(schema: TableSchema, prev: dict, *, source: OpSource) -> Op:
         table=schema.table,
         plugin=schema.plugin,
         source=source,
-        description=f'{schema.table}: DROP COLUMN "{col}" — every existing value snapshotted to _trash first',
+        description=(
+            f'{schema.table}: DROP COLUMN "{col}" — every existing value snapshotted to _trash first '
+            f"(chunked, {COLUMN_DROP_CHUNK_SIZE} rows/entry)"
+        ),
         sql=[snapshot_sql, drop_sql],
         destructive=True,
     )
