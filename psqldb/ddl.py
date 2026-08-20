@@ -145,10 +145,26 @@ def create_table_sql(
 
 
 def index_sql(schema: TableSchema) -> list[str]:
+    """Every declared index defaults to Postgres's own default access
+    method (B-tree, via no `USING` clause at all) — except a single-field
+    index on a JSONB column (JSON or MULTIFILE — both physically JSONB),
+    which gets `USING GIN` instead: B-tree can only help a JSONB column
+    with whole-document equality, GIN is what actually serves `@>`/`?`/
+    `?&`/`?|` containment queries, so there's no real case where a lone
+    JSONB field would WANT B-tree. A JSONB field combined with others in
+    the same composite index still gets plain B-tree — GIN's containment
+    semantics don't compose with equality on sibling columns the way a
+    composite B-tree does, so that combination is left as-is rather than
+    guessed at."""
     stmts = []
     for idx in schema.indexes:
         cols = ", ".join(f'"{c}"' for c in idx["fields"])
-        stmts.append(f'CREATE INDEX IF NOT EXISTS "{idx["key"]}" ON "{schema.table}" ({cols})')
+        using = ""
+        if len(idx["fields"]) == 1:
+            field = schema.columns_by_name.get(idx["fields"][0])
+            if field is not None and field.sql_type() == "JSONB":
+                using = "USING GIN "
+        stmts.append(f'CREATE INDEX IF NOT EXISTS "{idx["key"]}" ON "{schema.table}" {using}({cols})')
     return stmts
 
 
