@@ -22,7 +22,7 @@ import subprocess
 import time
 import warnings
 from pathlib import Path
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, unquote, urlparse
 
 import asyncpg
 import typer
@@ -593,6 +593,38 @@ def clear(
     console.print("[bold green]Clear complete.[/bold green]")
 
 
+def _pg_connection_args(dsn: str) -> tuple[list[str], str, dict[str, str]]:
+    """Splits `dsn` into (connection args, dbname, environment) for
+    pg_dump/pg_restore, instead of handing either tool the raw DSN as a
+    single argv element.
+
+    argv is world-readable for the life of the process — any local user
+    can read the full DSN, password included, out of /proc/<pid>/cmdline
+    or `ps aux` — but a process's own environment is not. host/port/user/
+    dbname aren't secret, so only the password moves to PGPASSWORD (the
+    standard env var every libpq client tool, including pg_dump/
+    pg_restore, already reads for exactly this); everything else stays in
+    argv where `console.print` can still show it. `unquote()` undoes this
+    project's own DSN construction (_dsn's docstring / the `connect`
+    command above quote_plus's user/password so `@`/`:`/`/` in either
+    can't be misparsed as DSN structure) — urlparse's own .username/
+    .password properties hand back the still-percent-encoded form, not
+    the real credential."""
+    parsed = urlparse(dsn)
+    args: list[str] = []
+    if parsed.hostname:
+        args += ["-h", parsed.hostname]
+    if parsed.port:
+        args += ["-p", str(parsed.port)]
+    if parsed.username:
+        args += ["-U", unquote(parsed.username)]
+    dbname = parsed.path.lstrip("/")
+    env = dict(os.environ)
+    if parsed.password:
+        env["PGPASSWORD"] = unquote(parsed.password)
+    return args, dbname, env
+
+
 # ------------------------------------------------------------------------ #
 # backup / restore — shell out to pg_dump/pg_restore, same "real client
 # tool, not a reimplementation" philosophy as `connect` above. Scoped
@@ -620,13 +652,14 @@ def backup(
         out = root / "backups" / "db" / f"{ts}.dump"
     out.parent.mkdir(parents=True, exist_ok=True)
 
-    argv = ["pg_dump", "-Fc", "-f", str(out), dsn]
+    conn_args, dbname, env = _pg_connection_args(dsn)
+    argv = ["pg_dump", "-Fc", "-f", str(out), *conn_args, dbname]
     tables = _tables_for_scope(root, plugin, table)
     for t in tables:
         argv += ["-t", t]
 
-    console.print(f"[dim]$ {' '.join(argv[:-1])} <dsn>[/dim]")
-    subprocess.run(argv, check=True)
+    console.print(f"[dim]$ {' '.join(argv)}[/dim]")
+    subprocess.run(argv, check=True, env=env)
     console.print(f"[bold green]Backup written to {out}[/bold green]")
 
 
@@ -648,14 +681,15 @@ def restore(
         raise typer.Exit(code=1)
 
     dsn = _dsn()
-    argv = ["pg_restore", "-d", dsn, "--clean", "--if-exists"]
+    conn_args, dbname, env = _pg_connection_args(dsn)
+    argv = ["pg_restore", *conn_args, "-d", dbname, "--clean", "--if-exists"]
     tables = _tables_for_scope(root, plugin, table)
     for t in tables:
         argv += ["-t", t]
     argv.append(str(dump_file))
 
-    console.print(f"[dim]$ pg_restore -d <dsn> --clean --if-exists ... {dump_file}[/dim]")
-    subprocess.run(argv, check=True)
+    console.print(f"[dim]$ {' '.join(argv)}[/dim]")
+    subprocess.run(argv, check=True, env=env)
     console.print("[bold green]Restore complete.[/bold green]")
 
 
