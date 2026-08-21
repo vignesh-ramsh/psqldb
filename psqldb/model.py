@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from dataclasses import field as dc_field
 from functools import cached_property
 from pathlib import Path
+from typing import Any
 
 from . import schema_spec
 from .fields import Field, FieldError, parse_field
@@ -49,6 +50,33 @@ POSTGRES_IDENTIFIER_LIMIT = 63  # NAMEDATALEN - 1; Postgres silently truncates p
 
 class SchemaError(ValueError):
     """A schema file itself (not one field in it) is invalid."""
+
+
+# An index/unique_together "key" — same shape fields._NAME_RE already
+# enforces on a field name, applied here too: both end up interpolated
+# straight into a quoted SQL identifier by psqldb.ddl (CREATE INDEX
+# "{key}" / CONSTRAINT "{key}"), never as a parameter. A key containing a
+# literal `"` breaks out of that identifier position; a schema file is
+# normally developer-authored, but save_schema_file (admin's Schema
+# Builder) accepts arbitrary `content` from an HTTP caller, so this is a
+# real, reachable input, not just a defensive-programming nicety.
+_KEY_RE = re.compile(r"^[a-z][a-z0-9_]*$")
+
+
+def _check_key(key: Any, kind: str, path: Path) -> None:
+    if not isinstance(key, str) or not _KEY_RE.match(key):
+        raise SchemaError(
+            f"{path}: {kind} key {key!r} must be a plain identifier matching "
+            f"[a-z][a-z0-9_]* (lowercase letters, digits, underscore, starting "
+            f"with a letter)."
+        )
+    if len(key) > POSTGRES_IDENTIFIER_LIMIT:
+        raise SchemaError(
+            f"{path}: {kind} key {key!r} is longer than Postgres's "
+            f"{POSTGRES_IDENTIFIER_LIMIT}-character identifier limit — Postgres "
+            f"would silently truncate it, risking a collision with an unrelated "
+            f"constraint/index. Shorten it."
+        )
 
 
 _RESERVED_SYSTEM_TABLE_NAMES = frozenset({"_trash", "_field_registry", "_patch_history"})
@@ -230,6 +258,7 @@ def _parse_fields_and_indexes(
             raise SchemaError(
                 f"{path}: each 'index' entry needs a 'key' and a non-empty 'fields' list."
             )
+        _check_key(key, "index", path)
         unknown = [f for f in idx_fields if f not in known_columns]
         if unknown:
             raise SchemaError(f"{path}: index '{key}' references unknown field(s) {unknown}.")
@@ -262,6 +291,7 @@ def _parse_unique_together(
                 f"'fields' list of at least 2 field names — a single field's "
                 f'own "unique": true already covers the one-column case.'
             )
+        _check_key(key, "unique_together", path)
         unknown = [f for f in ut_fields if f not in known_columns]
         if unknown:
             raise SchemaError(
