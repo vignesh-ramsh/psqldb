@@ -65,9 +65,9 @@ def _dsn() -> str:
 def setup() -> None:
     """Interactively configure the Postgres connection (host/port/database/
     user/password), validating connectivity before saving — the guided
-    alternative to hand-composing a DSN for `arc settings set psqldb_dsn
+    alternative to hand-composing a DSN for `arc settings set pgdb_dsn
     ... --secret`. Safe to re-run: asks before overwriting an existing
-    psqldb_dsn, showing what it would replace."""
+    pgdb_dsn, showing what it would replace."""
     root = find_project_root()
     if root is None:
         err_console.print(
@@ -80,7 +80,7 @@ def setup() -> None:
     if existing is not None:
         parsed_existing = urlparse(existing)
         console.print(
-            f"[yellow]psqldb_dsn is already set[/yellow] "
+            f"[yellow]pgdb_dsn is already set[/yellow] "
             f"({parsed_existing.hostname}:{parsed_existing.port or 5432}"
             f"/{parsed_existing.path.lstrip('/')})."
         )
@@ -149,11 +149,11 @@ def status() -> None:
         version, elapsed = asyncio.run(_check())
     except Exception as exc:
         err_console.print(
-            f"psqldb: FAILED to connect to {parsed.hostname}:{parsed.port or 5432} — {exc}"
+            f"pgdb: FAILED to connect to {parsed.hostname}:{parsed.port or 5432} — {exc}"
         )
         raise typer.Exit(code=1)
 
-    console.print(f"[bold green]psqldb: OK[/bold green] ({elapsed * 1000:.0f}ms)")
+    console.print(f"[bold green]pgdb: OK[/bold green] ({elapsed * 1000:.0f}ms)")
     console.print(f"  host:     {parsed.hostname}:{parsed.port or 5432}")
     console.print(f"  database: {parsed.path.lstrip('/')}")
     console.print(f"  server:   {version}")
@@ -196,15 +196,15 @@ def connect() -> None:
 
 # ------------------------------------------------------------------------ #
 # plan / migrate — arc.boot() first (so every business plugin's own
-# register() has called arc.psqldb.register_model(...)), then diff each
+# register() has called arc.pgdb.register_model(...)), then diff each
 # registered schema against the live DB. Same "boot to collect declarations"
 # pattern as `arc gateway routes`.
 # ------------------------------------------------------------------------ #
-def _boot() -> "PsqlDbProvider":  # noqa: F821 - forward ref, avoids importing arc's own psqldb attribute at module load
+def _boot() -> "PgDbProvider":  # noqa: F821 - forward ref, avoids importing arc's own pgdb attribute at module load
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", arc.ArcAdvisory)
         arc.boot()
-    return arc.psqldb
+    return arc.pgdb
 
 
 @contextlib.contextmanager
@@ -243,18 +243,18 @@ def _build_plan(plugin: str | None, table: str | None) -> migrate.MigrationPlan:
         raise typer.Exit(code=1)
 
     async def _do() -> migrate.MigrationPlan:
-        async with arc.psqldb.acquire() as conn:
+        async with arc.pgdb.acquire() as conn:
             # Always diff the FULL schema set (a -p scope must not make other
             # plugins' tables look "no longer declared" to _dropped_table_ops),
             # then narrow both ops AND schemas to the scope — see _scope_plan.
             the_plan = await migrate.build_plan(
-                conn, arc.psqldb.schemas(), arc.psqldb.patches(), only_table=table
+                conn, arc.pgdb.schemas(), arc.pgdb.patches(), only_table=table
             )
             if plugin:
                 _scope_plan(the_plan, plugin)
             return the_plan
 
-    return arc.runtime.run_async(_do(), open=("psqldb",))
+    return arc.runtime.run_async(_do(), open=("pgdb",))
 
 
 def _scope_plan(plan: migrate.MigrationPlan, plugin: str) -> None:
@@ -382,8 +382,8 @@ def _write_local_schemas(root: Path) -> None:
 
     schema_dir = root / ".arc" / SCHEMA_DIR_NAME
     schema_dir.mkdir(parents=True, exist_ok=True)
-    schema_path = schema_dir / "psqldb-schema.schema.json"
-    patch_path = schema_dir / "psqldb-patch.schema.json"
+    schema_path = schema_dir / "pgdb-schema.schema.json"
+    patch_path = schema_dir / "pgdb-patch.schema.json"
     schema_path.write_text(_json.dumps(schema_spec.schema_json(), indent=2) + "\n")
     patch_path.write_text(_json.dumps(schema_spec.patch_schema_json(), indent=2) + "\n")
     console.print(f"[dim]wrote {schema_path}[/dim]")
@@ -450,12 +450,12 @@ def migrate_(
 
     async def _do() -> bool:
         # boot() already ran (arc.runtime.run_async does it before opening
-        # psqldb below) — arc.psqldb IS the same provider _boot() used to
+        # psqldb below) — arc.pgdb IS the same provider _boot() used to
         # return separately. Returns whether a REAL migration happened
         # (False for "nothing to do" or "maintenance ops only") — the
         # caller uses this to decide whether "Migration complete." is
         # worth printing at all.
-        provider = arc.psqldb
+        provider = arc.pgdb
         schemas, patches = provider.schemas(), provider.patches()
         target_plugins = {s.plugin for s in schemas if not plugin or s.plugin == plugin} | {
             p.plugin for p in patches if not plugin or p.plugin == plugin
@@ -500,7 +500,7 @@ def migrate_(
         return True
 
     with _friendly_errors():
-        applied = arc.runtime.run_async(_do(), open=("psqldb",))
+        applied = arc.runtime.run_async(_do(), open=("pgdb",))
     if applied:
         console.print("[bold green]Migration complete.[/bold green]")
 
@@ -585,11 +585,11 @@ def clear(
 
     async def _do() -> None:
         for t in ordered:
-            count = await arc.psqldb.clear(t)
+            count = await arc.pgdb.clear(t)
             console.print(f"  {t}: {count} row(s) cleared (recoverable via `arc psqldb trash`)")
 
     with _friendly_errors():
-        arc.runtime.run_async(_do(), open=("psqldb",))
+        arc.runtime.run_async(_do(), open=("pgdb",))
     console.print("[bold green]Clear complete.[/bold green]")
 
 
@@ -770,7 +770,7 @@ def trash_recover(
 
             # jsonb_populate_record does server-side, per-column type
             # coercion (timestamps, uuids, ints, ...) — this connection has
-            # no custom codecs registered (unlike arc.psqldb's own pool), so
+            # no custom codecs registered (unlike arc.pgdb's own pool), so
             # the snapshot's ISO-formatted strings etc. would otherwise fail
             # to bind as native Python types on the client side.
             if row["drop_type"] in ("Row", "Table"):

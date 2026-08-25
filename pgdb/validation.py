@@ -5,7 +5,7 @@ App-tier field validation — for the types that have no DB-level guarantee
 (fields.APP_VALIDATED_TYPES): EMAIL, PHONE, SELECT, TABLE. REFERENCE needs
 no entry here — it's a real FK constraint, the DB already enforces it.
 
-Run from PsqlDbProvider.insert()/update() (see psqldb/__init__.py) so real
+Run from PgDbProvider.insert()/update() (see pgdb/__init__.py) so real
 CRUD is exercised now, ahead of Relay; Relay's future CRUD reuses this
 module rather than re-implementing per-type checks.
 """

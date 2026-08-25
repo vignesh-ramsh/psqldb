@@ -1,7 +1,7 @@
 """
 psqldb — ARC provider plugin: PostgreSQL via asyncpg.
 
-Exports `arc.psqldb`: a connection pool plus the small set of primitives
+Exports `arc.pgdb`: a connection pool plus the small set of primitives
 that Relay's future bounded query engine (Architecture §3.4) will build on
 — acquire/transaction/execute/fetch. Deliberately NOT a query builder or an
 ORM: the bounded query engine and the raw-SQL escape hatch (`arc.sql(...)`)
@@ -12,7 +12,7 @@ Lifecycle note (a known simplification, not an oversight): register() only
 *constructs* the provider — it does not open the pool, because register()
 itself is synchronous (arc.boot() is deliberately sync-callable) while
 asyncpg.create_pool() is async. The application's own async entrypoint is
-expected to `await arc.psqldb.open()` on startup and `await arc.psqldb
+expected to `await arc.pgdb.open()` on startup and `await arc.pgdb
 .close()` on shutdown. Automatic lifecycle wiring belongs to a future
 Gateway/arc.health design, not to this plugin.
 """
@@ -29,7 +29,7 @@ import asyncpg
 
 import arc  # arc.codec is stateless and importable pre-boot — same pattern relay/gateway use
 
-from . import fields, migrate, validation  # noqa: F401 - re-exported as arc.psqldb.fields / .migrate / .validation
+from . import fields, migrate, validation  # noqa: F401 - re-exported as arc.pgdb.fields / .migrate / .validation
 from .model import (  # noqa: F401
     SchemaError,
     TableSchema,
@@ -40,17 +40,17 @@ from .model import (  # noqa: F401
 )
 from .validation import ValidationError  # noqa: F401
 
-CAPABILITY = "psqldb"
+CAPABILITY = "pgdb"
 
-DSN_KEY = "psqldb_dsn"
-POOL_MIN_SIZE_KEY = "psqldb_pool_min_size"
-POOL_MAX_SIZE_KEY = "psqldb_pool_max_size"
-SLOW_QUERY_THRESHOLD_MS_KEY = "psqldb_slow_query_threshold_ms"
-STATEMENT_TIMEOUT_MS_KEY = "psqldb_statement_timeout_ms"
-POOL_ACQUIRE_TIMEOUT_MS_KEY = "psqldb_pool_acquire_timeout_ms"
-IDLE_IN_TRANSACTION_TIMEOUT_MS_KEY = "psqldb_idle_in_transaction_timeout_ms"
+DSN_KEY = "pgdb_dsn"
+POOL_MIN_SIZE_KEY = "pgdb_pool_min_size"
+POOL_MAX_SIZE_KEY = "pgdb_pool_max_size"
+SLOW_QUERY_THRESHOLD_MS_KEY = "pgdb_slow_query_threshold_ms"
+STATEMENT_TIMEOUT_MS_KEY = "pgdb_statement_timeout_ms"
+POOL_ACQUIRE_TIMEOUT_MS_KEY = "pgdb_pool_acquire_timeout_ms"
+IDLE_IN_TRANSACTION_TIMEOUT_MS_KEY = "pgdb_idle_in_transaction_timeout_ms"
 
-_logger = logging.getLogger("psqldb")
+_logger = logging.getLogger("pgdb")
 
 # Only the fields the DB (or the CRUD helpers themselves) always supplies a
 # correct value for get silently stripped from a caller's insert()/update()
@@ -99,7 +99,7 @@ def _chunk_rows(rows: list, params_per_row: int) -> list[list]:
     return [rows[i : i + chunk_size] for i in range(0, len(rows), chunk_size)]
 
 
-class PsqlDbProvider:
+class PgDbProvider:
     """Thin asyncpg wrapper: a pool, the schema/migration system
     (register_model/plan/migrate), and the small set of CRUD primitives
     Relay's future bounded query engine will build on top of — see
@@ -163,7 +163,7 @@ class PsqlDbProvider:
 
     # ------------------------------------------------------------------ #
     # Schema registration — called from a business plugin's own
-    # register(kernel), e.g. `arc.psqldb.register_model(Path(__file__).parent / "schemas")`.
+    # register(kernel), e.g. `arc.pgdb.register_model(Path(__file__).parent / "schemas")`.
     # Attributed to whichever plugin is currently registering (Kernel
     # tracks this already — see Kernel.current_plugin()) so callers never
     # pass their own name by hand.
@@ -207,7 +207,7 @@ class PsqlDbProvider:
         self._on_schema_registered.append(callback)
 
     # ------------------------------------------------------------------ #
-    # Patch registration — `arc.psqldb.register_patches(Path(__file__).parent / "patches")`.
+    # Patch registration — `arc.pgdb.register_patches(Path(__file__).parent / "patches")`.
     # Unlike register_model(), no table-name collision check happens here:
     # multiple plugins legitimately targeting the same table via patches is
     # the whole point. Field-id-level ownership collisions are caught later,
@@ -243,7 +243,7 @@ class PsqlDbProvider:
     def reload_schema_file(self, path: Path, *, plugin: str, is_patch: bool) -> TableSchema:
         """Re-parses ONE schema/patch file from disk and replaces its entry
         in this process's in-memory registry (self._schemas/_patches,
-        self._by_table) so every subsequent arc.relay/arc.psqldb read or
+        self._by_table) so every subsequent arc.relay/arc.pgdb read or
         write in THIS process sees the new shape immediately — no restart
         needed here. Matches (and replaces) the previous registration for
         the same file by `source_path`; a file never seen before (a
@@ -289,7 +289,7 @@ class PsqlDbProvider:
         ):  # no running loop (sync/test caller) — event skipped
             _asyncio.get_running_loop()
             _asyncio.ensure_future(
-                arc.events.emit("psqldb.schema.changed", table=schema.table, plugin=plugin)
+                arc.events.emit("pgdb.schema.changed", table=schema.table, plugin=plugin)
             )
         return schema
 
@@ -429,14 +429,14 @@ class PsqlDbProvider:
         is the one place this needs to happen; nothing downstream (relay,
         the Query Engine, a business plugin) has to do its own UTC math.
 
-        Also applies `statement_timeout` (psqldb_statement_timeout_ms,
+        Also applies `statement_timeout` (pgdb_statement_timeout_ms,
         default 30s) so one runaway query can't hold a connection (and
         whatever locks it's taken) forever; `idle_in_transaction_session_timeout`
-        (psqldb_idle_in_transaction_timeout_ms, default 60s) so an open-but-
+        (pgdb_idle_in_transaction_timeout_ms, default 60s) so an open-but-
         idle transaction (an abandoned BEGIN, a hung task) can't do the same
         thing for a different reason — no query running, just never
         committed or rolled back; and — if
-        psqldb_slow_query_threshold_ms is set above 0 — registers a slow-
+        pgdb_slow_query_threshold_ms is set above 0 — registers a slow-
         query logger via asyncpg's own `add_query_logger` (its official
         instrumentation hook, not a hand-rolled wrapper around every CRUD
         method), so every query through this pool is measured the same
@@ -493,9 +493,9 @@ class PsqlDbProvider:
             self._pool = None
 
     def acquire(self):
-        """`async with arc.psqldb.acquire() as conn:` — one pooled connection.
+        """`async with arc.pgdb.acquire() as conn:` — one pooled connection.
 
-        Bounded by `psqldb_pool_acquire_timeout_ms` (default 10s, 0
+        Bounded by `pgdb_pool_acquire_timeout_ms` (default 10s, 0
         disables it) — asyncpg's own `Pool.acquire()` default is an
         UNBOUNDED wait, which turns ordinary pool contention into a
         silent, permanent hang the instant demand exceeds supply, rather
@@ -535,7 +535,7 @@ class PsqlDbProvider:
         timeout that actually times out."""
         if self._pool is None:
             raise RuntimeError(
-                "psqldb pool is not open — call `await arc.psqldb.open()` "
+                "pgdb pool is not open — call `await arc.pgdb.open()` "
                 "during your application's startup first."
             )
         timeout = self.pool_acquire_timeout_ms / 1000 if self.pool_acquire_timeout_ms > 0 else None
@@ -1136,7 +1136,7 @@ def register(kernel: Any) -> None:
     pool_acquire_timeout_ms = kernel.settings.get(POOL_ACQUIRE_TIMEOUT_MS_KEY)
     idle_in_transaction_timeout_ms = kernel.settings.get(IDLE_IN_TRANSACTION_TIMEOUT_MS_KEY)
 
-    provider = PsqlDbProvider(
+    provider = PgDbProvider(
         kernel,
         dsn,
         min_size=min_size,
@@ -1149,6 +1149,6 @@ def register(kernel: Any) -> None:
     kernel.export(CAPABILITY, provider, requires=[], optional_requires=[])
     # system.reload -> full re-scan of every registered schemas/patches
     # directory (see reconcile()'s own docstring). Subscribed here, inside
-    # register(), so the subscription is attributed to "psqldb" and dies
+    # register(), so the subscription is attributed to "pgdb" and dies
     # with this kernel on a re-boot (arc.events' per-Kernel registry).
     arc.events.on(arc.events.RELOAD_EVENT, provider.reconcile)

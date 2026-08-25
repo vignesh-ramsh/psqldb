@@ -1,6 +1,6 @@
 [plugin]
-name = "psqldb"
+name = "pgdb"
 version = "0.1.0"
-capability = "psqldb"
+capability = "pgdb"
 requires = []
 optional_requires = []

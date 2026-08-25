@@ -6,7 +6,7 @@ Loads one plugin's `schemas/*.json` directory into TableSchema objects.
 Convention (business-plugin side): a plugin declares its own tables under
 `plugins/<name>/schemas/<Table Name>.json` — one file per table, filename
 (slugified) becomes the physical table name. A business plugin's register()
-calls `arc.psqldb.register_model(path_to_its_schemas_dir)` — see
+calls `arc.pgdb.register_model(path_to_its_schemas_dir)` — see
 psqldb.migrate.ModelRegistry — which is how psqldb discovers what to diff
 and apply, without ever importing a business plugin's Python code to do it.
 

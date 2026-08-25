@@ -59,7 +59,7 @@ from . import ddl, introspect
 from .fields import Field
 from .model import SchemaError, TableSchema, load_schemas_dir
 
-_logger = logging.getLogger("psqldb")
+_logger = logging.getLogger("pgdb")
 
 # One fixed key shared by every `arc psqldb migrate` run against every
 # database — a stable (deterministic, not Python's salted hash()) 32-bit
@@ -1046,7 +1046,7 @@ async def build_plan(
         Op(
             kind="create_table",
             table="_bootstrap",
-            plugin="psqldb",
+            plugin="pgdb",
             description="ensure shared trigger functions (arc_uuid_generate_v7, "
             "arc_set_updated_at, arc_soft_delete_to_trash) are current",
             sql=list(ddl.BOOTSTRAP_FUNCTIONS_SQL),
@@ -1059,7 +1059,7 @@ async def build_plan(
             Op(
                 kind="create_table",
                 table="_bootstrap",
-                plugin="psqldb",
+                plugin="pgdb",
                 description="bootstrap: pgcrypto extension, _field_registry, _trash, _patch_history",
                 sql=list(ddl.BOOTSTRAP_STRUCTURAL_SQL),
                 destructive=False,
