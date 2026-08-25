@@ -1,10 +1,10 @@
 """
-psqldb.migrate
+pgdb.migrate
 -------------------
-Orchestrates everything `arc psqldb plan` / `arc psqldb migrate` do:
+Orchestrates everything `arc pgdb plan` / `arc pgdb migrate` do:
 collect declared schemas AND patches -> diff each against `_field_registry`
 (the DB's memory of "the schema as of the last successful migration", see
-psqldb.introspect) -> render a plan -> optionally apply it, updating
+pgdb.introspect) -> render a plan -> optionally apply it, updating
 `_field_registry` to match and recording the change in `_patch_history`.
 
 Two declaration sources, one diff engine:
@@ -14,7 +14,7 @@ Two declaration sources, one diff engine:
     DIFFERENT plugin's schema). Never creates a table (skipped with a
     warning if the target doesn't exist yet, or if the target is a
     `"system": true` table — those self-declare their entire structure,
-    psqldb.model, so no other plugin's patch ever applies to one); can drop
+    pgdb.model, so no other plugin's patch ever applies to one); can drop
     a field it previously added via an earlier patch if that patch no
     longer declares it — same Trash-backed path as any other column drop.
   * Both are diffed OWNERSHIP-SCOPED: a schema or patch only ever compares
@@ -61,7 +61,7 @@ from .model import SchemaError, TableSchema, load_schemas_dir
 
 _logger = logging.getLogger("pgdb")
 
-# One fixed key shared by every `arc psqldb migrate` run against every
+# One fixed key shared by every `arc pgdb migrate` run against every
 # database — a stable (deterministic, not Python's salted hash()) 32-bit
 # value derived from a fixed string, well within Postgres's signed-bigint
 # advisory-lock key range. Not a real secret, not table/schema-specific:
@@ -161,7 +161,7 @@ class MigrationError(RuntimeError):
 
 @contextlib.asynccontextmanager
 async def migration_lock(conn: Any, *, poll_interval: float = 1.0):
-    """Serializes concurrent `arc psqldb migrate` runs against the same
+    """Serializes concurrent `arc pgdb migrate` runs against the same
     database — two replicas deploying at once must not both diff-and-apply
     DDL concurrently. Uses Postgres's own session-level advisory lock
     (pg_advisory_lock/pg_try_advisory_lock/pg_advisory_unlock): it works
@@ -192,7 +192,7 @@ async def migration_lock(conn: Any, *, poll_interval: float = 1.0):
             break
         if not announced:
             _logger.info(
-                "another `arc psqldb migrate` is already running against this "
+                "another `arc pgdb migrate` is already running against this "
                 "database — waiting for it to finish..."
             )
             announced = True
@@ -281,7 +281,7 @@ def _resolve_child_owners(schemas: list[TableSchema]) -> dict[str, TableSchema]:
 # purpose: the point is one notice per distinct `target` value for the
 # lifetime of the process, not one per resolve_ref_targets() call (which
 # may run repeatedly — plan, then migrate, then a system.reload
-# recomputing psqldb's own cached ref_targets()).
+# recomputing pgdb's own cached ref_targets()).
 _warned_table_name_targets: set[str] = set()
 
 
@@ -289,7 +289,7 @@ def resolve_ref_targets(schemas: list[TableSchema]) -> dict[str, str]:
     """Maps each REFERENCE/TABLE field's raw `target` to the physical,
     slugified table it resolves to (e.g. "Employee" -> "employee"). Used
     both for DDL rendering and for insert()-time FK existence checks
-    (psqldb.validation). Callers pass schemas + patches together so a
+    (pgdb.validation). Callers pass schemas + patches together so a
     patch's own REFERENCE fields resolve against the same known-table set
     schemas do.
 
@@ -404,14 +404,14 @@ def resolve_ref_columns(
 def order_for_clear(
     tables: set[str], ref_columns: dict[tuple[str, str], "ddl.RefColumn"]
 ) -> list[str]:
-    """Orders a set of tables so `arc psqldb clear -p <plugin>` (which
+    """Orders a set of tables so `arc pgdb clear -p <plugin>` (which
     clears every table a plugin owns in one pass) respects REFERENCE
     dependencies among them: a table that references another via a real
     FK (ON DELETE RESTRICT, §3.9's REFERENCE type) must be cleared FIRST —
     clear's soft-delete-to-trash trigger issues a real physical DELETE the
     moment a row's _state hits 99, and that DELETE fails outright with a
     live ForeignKeyViolationError if some OTHER row (in this same clear
-    batch) still references it. Found by running `arc psqldb clear -p
+    batch) still references it. Found by running `arc pgdb clear -p
     example_hr` for real: 'department' sorted alphabetically before
     'employee', but employee.department REFERENCES department.code —
     clearing department's rows first hit exactly that violation.
@@ -451,7 +451,7 @@ def order_for_clear(
         raise MigrationError(
             f"cannot determine a safe clear order for {remaining} — a circular "
             f"REFERENCE dependency exists among them. Clear them individually "
-            f"(`arc psqldb clear -t <table>`), breaking the cycle by hand first."
+            f"(`arc pgdb clear -t <table>`), breaking the cycle by hand first."
         )
     return order
 
@@ -459,7 +459,7 @@ def order_for_clear(
 def order_for_create(
     tables: list[str], ref_columns: dict[tuple[str, str], "ddl.RefColumn"]
 ) -> list[str]:
-    """Orders a set of tables so a fresh `arc psqldb migrate` creates a
+    """Orders a set of tables so a fresh `arc pgdb migrate` creates a
     REFERENCE's target table before the table that points to it — the
     opposite requirement from order_for_clear (§ above), same underlying
     dependency graph. ddl._user_column_sql renders REFERENCES inline in the
@@ -471,7 +471,7 @@ def order_for_create(
     previously only ordered TABLE (child) schemas after their parents —
     plain REFERENCE dependencies among non-child tables were never
     considered at all, and schema files are loaded in sorted filename
-    order (psqldb.model.load_schemas_dir), which has no reason to match
+    order (pgdb.model.load_schemas_dir), which has no reason to match
     dependency order. A schema named "_access_keys.json" referencing
     "_users.json" sorts before it alphabetically — exactly the failure
     case this closes.
@@ -561,7 +561,7 @@ async def _diff_table(
     Without this, a patch whose target table is being created for the very
     first time by its own plugin's schema, in the same migrate run, always
     looked like it targeted a nonexistent table and was silently skipped
-    with just a warning — needing a SECOND `arc psqldb migrate` before the
+    with just a warning — needing a SECOND `arc pgdb migrate` before the
     patch's fields ever actually applied. build_plan processes every schema
     before any patch (see its own loop order), so by the time a patch is
     diffed, `will_exist` already reflects every table this pass is creating."""
@@ -616,7 +616,7 @@ async def _diff_table(
             )
         raise MigrationError(
             f"table '{schema.table}' already exists in the database but is not "
-            f"tracked in _field_registry (not created by `arc psqldb migrate`) — "
+            f"tracked in _field_registry (not created by `arc pgdb migrate`) — "
             f"refusing to adopt an unmanaged table automatically. Left untouched."
         )
 
@@ -1165,7 +1165,7 @@ async def build_plan(
             continue
         if patch.table in system_tables:
             # Patches never apply to system tables — a "system": true table
-            # self-declares its ENTIRE structure itself (psqldb.model);
+            # self-declares its ENTIRE structure itself (pgdb.model);
             # letting some other plugin patch fields onto it would mean its
             # shape is no longer fully self-declared. Same "skip, don't
             # error" treatment as a patch aimed at a table that doesn't
@@ -1335,7 +1335,7 @@ def registry_upsert_sql(schemas: list[TableSchema], ref_targets: dict[str, str])
             )
             # ON CONFLICT, not a plain INSERT: a patch legitimately
             # redeclaring a field id ITS OWN plugin's schema also declares
-            # (psqldb.schema()'s own merge already treats this as "a
+            # (pgdb.schema()'s own merge already treats this as "a
             # legitimate rename/retype... supersedes the schema's version")
             # used to crash outright with a duplicate-key violation on
             # ("table", id) — the DELETE above runs once per (table,
@@ -1400,7 +1400,7 @@ def unique_together_upsert_sql(schemas: list[TableSchema]) -> list[str]:
 
 def patch_history_sql(ops: list[Op], reference: str) -> list[str]:
     """One row per distinct (plugin, table, kind) actually touched by
-    `ops`. Only psqldb's own infra ops are excluded — the "_bootstrap"
+    `ops`. Only pgdb's own infra ops are excluded — the "_bootstrap"
     sentinel and "_audit_*" table creation. A business-declared
     `"system": true` table (authn's `_users`, relay's `_job_log`, ...)
     legitimately starts with "_" and IS part of the history — the earlier
@@ -1425,7 +1425,7 @@ def patch_history_sql(ops: list[Op], reference: str) -> list[str]:
 
 def migration_reference() -> str:
     """A single timestamp shared by every plugin's generated migration file
-    for one `arc psqldb migrate` run — used both as the filename and as
+    for one `arc pgdb migrate` run — used both as the filename and as
     _patch_history.reference."""
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
 
@@ -1436,7 +1436,7 @@ def write_migration_file(
     migrations_dir = plugin_dir / "migrations"
     migrations_dir.mkdir(parents=True, exist_ok=True)
     path = migrations_dir / f"{reference}_migration.sql"
-    lines = [f"-- generated by `arc psqldb migrate` for plugin '{plugin}'", ""]
+    lines = [f"-- generated by `arc pgdb migrate` for plugin '{plugin}'", ""]
     for op in plan.ops:
         if op.plugin != plugin:
             continue

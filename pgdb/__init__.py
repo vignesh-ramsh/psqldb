@@ -1,5 +1,5 @@
 """
-psqldb — ARC provider plugin: PostgreSQL via asyncpg.
+pgdb — ARC provider plugin: PostgreSQL via asyncpg.
 
 Exports `arc.pgdb`: a connection pool plus the small set of primitives
 that Relay's future bounded query engine (Architecture §3.4) will build on
@@ -65,10 +65,10 @@ _SYSTEM_COLUMN_NAMES = frozenset(
 
 def _as_dict(record: asyncpg.Record | None) -> dict | None:
     """asyncpg.Record is read-only and doesn't compare equal to a dict with
-    the same contents — every consumer of a psqldb row used to have to know
+    the same contents — every consumer of a pgdb row used to have to know
     to `dict(row)` it themselves before it behaved like a normal Python
     value (relay's own code already did this at every call site). Converting
-    HERE, once, at the source, makes psqldb's own CRUD primitives return the
+    HERE, once, at the source, makes pgdb's own CRUD primitives return the
     same plain-dict shape relay's public API already promises."""
     return dict(record) if record is not None else None
 
@@ -152,7 +152,7 @@ class PgDbProvider:
         # register_model() call — exists so a plugin whose OWN register()
         # runs before some other plugin's schema is registered (topological
         # order, §3.1) can still react to that schema once it does show up,
-        # without psqldb needing to know or care who's listening or why. The
+        # without pgdb needing to know or care who's listening or why. The
         # kernel has no "every plugin has finished booting" phase (arc.runtime
         # .boot() just runs each register() in order and returns), so this —
         # not a one-shot post-boot hook — is what makes a subscriber's own
@@ -201,7 +201,7 @@ class PgDbProvider:
         patch can add a field (e.g. filer's FILE/MULTIFILE) to a table
         whose base schema was registered long before this subscriber
         existed — `table` is what's passed either way, so a subscriber
-        that re-derives its interest from `psqldb.schema(table)` (the
+        that re-derives its interest from `pgdb.schema(table)` (the
         merged, patches-included view) sees the correct current shape
         regardless of which registration call actually triggered it."""
         self._on_schema_registered.append(callback)
@@ -211,7 +211,7 @@ class PgDbProvider:
     # Unlike register_model(), no table-name collision check happens here:
     # multiple plugins legitimately targeting the same table via patches is
     # the whole point. Field-id-level ownership collisions are caught later,
-    # at plan/migrate time (psqldb.migrate — needs a DB round-trip to know
+    # at plan/migrate time (pgdb.migrate — needs a DB round-trip to know
     # who owns what), not here.
     # ------------------------------------------------------------------ #
     def register_patches(self, patches_dir: str | Path) -> list[TableSchema]:
@@ -337,7 +337,7 @@ class PgDbProvider:
         """Duck-typed contract for arc.events' process bridge: an opaque
         token that changes whenever this capability's reloadable state may
         have changed. _patch_history.applied_at moves on EVERY schema
-        apply, from any process (`arc psqldb migrate`, admin's Apply Now)
+        apply, from any process (`arc pgdb migrate`, admin's Apply Now)
         — the DB itself is the notification medium, so no redix, no
         supervisor, no configuration is needed for cross-process schema
         propagation (proposal §9/§14). Pre-bootstrap (table doesn't exist
@@ -363,7 +363,7 @@ class PgDbProvider:
         validates a field name against schema.column_fields() rejected it
         as "unknown").
 
-        psqldb.migrate deliberately does NOT go through this — the
+        pgdb.migrate deliberately does NOT go through this — the
         ownership-scoped diffing in _diff_table needs schema and patches
         kept SEPARATE (self._schemas / self._patches), and works from
         those directly."""
@@ -609,7 +609,7 @@ class PgDbProvider:
         """Every CRUD primitive below accepts an optional `conn` — when
         given (Relay, running hooks + the write in one shared transaction),
         it's used directly and the caller owns the transaction; when None
-        (direct psqldb use, unrelated to Relay), a connection is acquired
+        (direct pgdb use, unrelated to Relay), a connection is acquired
         and released here exactly as before."""
         if conn is not None:
             yield conn
@@ -685,11 +685,11 @@ class PgDbProvider:
         self, table: str, id: UUID, *, deleted_by: str | None = None, conn: Any = None
     ) -> None:
         """Never a hard DELETE for a normal/child table — sets `_state = 99`.
-        The DB-level arc_soft_delete_to_trash trigger (psqldb.ddl) takes it
+        The DB-level arc_soft_delete_to_trash trigger (pgdb.ddl) takes it
         from there: snapshots the row into `_trash`, cascades to any child
         tables via the same mechanism, then physically removes the row.
 
-        A `"system": true` table (psqldb.model) has none of that machinery —
+        A `"system": true` table (pgdb.model) has none of that machinery —
         no `_state` column, no trigger attached (§3.9) — so soft-delete
         genuinely isn't applicable to it, only a real hard DELETE is. Not an
         error case: a system table simply IS the "always hard delete" table
@@ -706,7 +706,7 @@ class PgDbProvider:
                 else:
                     # A real DELETE too, once the soft-delete UPDATE above
                     # sets _state=99 — the arc_soft_delete_to_trash trigger
-                    # (psqldb.ddl) snapshots the row into _trash and then
+                    # (pgdb.ddl) snapshots the row into _trash and then
                     # physically removes it in the same statement, so a row
                     # still referenced by another table's plain REFERENCE
                     # column (not a child/TABLE field, which cascades) can
@@ -947,7 +947,7 @@ class PgDbProvider:
             )
 
     async def clear(self, table: str, *, cleared_by: str | None = None) -> int:
-        """`arc psqldb clear` — every row in `table` goes through the same
+        """`arc pgdb clear` — every row in `table` goes through the same
         soft-delete-to-trash trigger as a single soft_delete() would, not a
         raw TRUNCATE: recoverable from _trash, and cascades to child tables
         automatically (same mechanism, no special-casing here). Slower than

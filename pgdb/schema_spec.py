@@ -1,9 +1,9 @@
 """
-psqldb.schema_spec
+pgdb.schema_spec
 -------------------
 Typed description of a schema/patch file's shape, expressed once as
-arc.codec Structs (msgspec) instead of only by hand in psqldb.fields /
-psqldb.model. Two things fall out of this ONE description, for free,
+arc.codec Structs (msgspec) instead of only by hand in pgdb.fields /
+pgdb.model. Two things fall out of this ONE description, for free,
 entirely locally (arc.codec is pure Python/msgspec introspection — no
 network access, ever, at any point):
 
@@ -11,12 +11,12 @@ network access, ever, at any point):
     editor can point at for autocomplete and inline validation of every
     schemas/*.json and patches/*.json file in the project;
   * a fast structural pre-check (validate_schema_dict / validate_patch_dict)
-    that runs before psqldb.model's own business-rule checks — catches
+    that runs before pgdb.model's own business-rule checks — catches
     "wrong JSON shape" mistakes (a typo'd key, an unknown type name, a
     string where a list belongs) with one clear message, before any of the
-    deeper field-by-field parsing in psqldb.fields.parse_field even starts.
+    deeper field-by-field parsing in pgdb.fields.parse_field even starts.
 
-This does NOT replace psqldb.model / psqldb.fields's own checks —
+This does NOT replace pgdb.model / pgdb.fields's own checks —
 cross-field and cross-file business rules ("a table needs exactly one
 unique field", "primary_key is UUID-only", "options is SELECT-only",
 "field ids must be unique within a file", ...) stay exactly where they
@@ -25,7 +25,7 @@ second implementation of them.
 
 Two small, deliberate tightenings over today's hand-rolled parsing (both
 low-risk — verified against every schema/patch file already in this repo):
-  * `type` must be spelled in canonical UPPERCASE (psqldb.fields.normalize_type
+  * `type` must be spelled in canonical UPPERCASE (pgdb.fields.normalize_type
     is case-insensitive; every real file already uses uppercase, so this
     changes nothing in practice, only tightens what a *new* file must do to
     validate).
@@ -47,7 +47,7 @@ from arc.codec import validate as codec_validate
 
 from .fields import CANONICAL_TYPES, TYPE_ALIASES
 
-# Every string psqldb.fields.normalize_type() would accept, built from the
+# Every string pgdb.fields.normalize_type() would accept, built from the
 # SAME constants it already uses — not hand-copied, so this can never
 # quietly drift from what actually gets accepted at load time.
 _TYPE_NAMES = tuple(sorted(CANONICAL_TYPES | set(TYPE_ALIASES)))
@@ -67,7 +67,7 @@ class UniqueTogetherSpec(Struct, forbid_unknown_fields=True):
     IndexSpec on purpose — same authoring convention, different meaning:
     an index is a performance hint (never auto-dropped, §3.9); this is a
     real correctness constraint, rendered as a genuine Postgres UNIQUE
-    constraint and diffed like one (psqldb.migrate)."""
+    constraint and diffed like one (pgdb.migrate)."""
 
     key: str
     fields: list[str]
@@ -78,7 +78,7 @@ class FieldSpec(Struct, forbid_unknown_fields=True):
     name: str
     type: FieldType
     required: bool = False
-    req: bool = False  # legacy alias for `required` (psqldb.fields.parse_field
+    req: bool = False  # legacy alias for `required` (pgdb.fields.parse_field
     # still reads raw.get("required", raw.get("req", False))) — kept here only
     # so an existing file spelled this way doesn't fail "unknown field" for
     # no reason; new files should use `required`.
@@ -100,7 +100,7 @@ class FieldSpec(Struct, forbid_unknown_fields=True):
     options: list[str] | None = None
     target: str | None = None
     target_field: str | None = None
-    group: str | None = None  # UI-only Row Editor section hint — see Field.group (psqldb.fields)
+    group: str | None = None  # UI-only Row Editor section hint — see Field.group (pgdb.fields)
 
 
 class SchemaFileSpec(Struct, forbid_unknown_fields=True):
@@ -138,7 +138,7 @@ def patch_schema_json() -> dict:
 
 def validate_schema_dict(raw: dict) -> None:
     """Structural pre-check for an already-JSON-parsed schema file. Raises
-    arc.codec.CodecError naming exactly what's wrong; the caller (psqldb.model)
+    arc.codec.CodecError naming exactly what's wrong; the caller (pgdb.model)
     wraps this into its own SchemaError with the file path attached."""
     codec_validate(raw, type=SchemaFileSpec)
 

@@ -1,5 +1,5 @@
 """
-psqldb.cli — `arc psqldb ...` commands.
+pgdb.cli — `arc pgdb ...` commands.
 
 Mounted onto the core `arc` CLI via the `arc.plugins.cli` entry point (see
 arc.plugin_cli in the kernel) — this file is never imported by the kernel
@@ -35,7 +35,7 @@ from arc.settings import SettingsManager
 
 from . import DSN_KEY, migrate
 
-app = typer.Typer(help="Commands for the psqldb provider.")
+app = typer.Typer(help="Commands for the pgdb provider.")
 trash_app = typer.Typer(help="Recover documents from _trash.")
 app.add_typer(trash_app, name="trash")
 console = Console()
@@ -119,14 +119,14 @@ def setup() -> None:
         version = asyncio.run(_check())
     except Exception as exc:
         err_console.print(f"FAILED to connect: {exc}")
-        console.print("[dim]Nothing saved — run `arc psqldb setup` again to retry.[/dim]")
+        console.print("[dim]Nothing saved — run `arc pgdb setup` again to retry.[/dim]")
         raise typer.Exit(code=1)
 
     mgr.set(DSN_KEY, dsn, secret=True)
     console.print(f"[bold green]Connected[/bold green] — {version}")
     console.print(f"[dim]Saved to {DSN_KEY} (encrypted, .arc/arc.secrets).[/dim]")
     console.print(
-        "[dim]Next: `arc psqldb migrate` to create tables in this database.[/dim]"
+        "[dim]Next: `arc pgdb migrate` to create tables in this database.[/dim]"
     )
 
 
@@ -324,14 +324,14 @@ def check(
     ),
 ) -> None:
     """Validate every schemas/*.json and patches/*.json file across every
-    plugin in the project — structural shape first (psqldb.schema_spec:
+    plugin in the project — structural shape first (pgdb.schema_spec:
     unknown keys, wrong JSON types, an unrecognized `type` name — entirely
     local, no database, no network), then the existing business-rule
     checks (a unique field is required, primary_key is UUID-only, ...)
-    layered on top exactly as they already run during `arc psqldb plan`/
+    layered on top exactly as they already run during `arc pgdb plan`/
     `migrate`. Unlike those commands, this never stops at the first bad
     plugin — it checks every plugin and reports every problem in one pass,
-    so `arc psqldb plan` failing on file #1 doesn't hide a second, unrelated
+    so `arc pgdb plan` failing on file #1 doesn't hide a second, unrelated
     mistake in file #7."""
     root = _root_or_exit()
     from arc import registry
@@ -404,11 +404,11 @@ def _write_local_schemas(root: Path) -> None:
 
     schemas_entry = {
         "fileMatch": ["plugins/*/*/schemas/*.json"],
-        "url": "./.arc/schema/psqldb-schema.schema.json",
+        "url": "./.arc/schema/pgdb-schema.schema.json",
     }
     patches_entry = {
         "fileMatch": ["plugins/*/*/patches/*.json"],
-        "url": "./.arc/schema/psqldb-patch.schema.json",
+        "url": "./.arc/schema/pgdb-patch.schema.json",
     }
     existing = settings.setdefault("json.schemas", [])
     for entry in (schemas_entry, patches_entry):
@@ -425,7 +425,7 @@ def plan(
     ),
     table: str = typer.Option(None, "-t", "--table", help="Only show changes for this table."),
 ) -> None:
-    """Preview what `arc psqldb migrate` would do — never touches the database."""
+    """Preview what `arc pgdb migrate` would do — never touches the database."""
     _root_or_exit()
     with _friendly_errors():
         the_plan = _build_plan(plugin, table)
@@ -450,7 +450,7 @@ def migrate_(
 
     async def _do() -> bool:
         # boot() already ran (arc.runtime.run_async does it before opening
-        # psqldb below) — arc.pgdb IS the same provider _boot() used to
+        # pgdb below) — arc.pgdb IS the same provider _boot() used to
         # return separately. Returns whether a REAL migration happened
         # (False for "nothing to do" or "maintenance ops only") — the
         # caller uses this to decide whether "Migration complete." is
@@ -539,7 +539,7 @@ def history(
 
     rows = asyncio.run(_run())
     if not rows:
-        console.print("[dim]No history recorded yet — run `arc psqldb migrate`.[/dim]")
+        console.print("[dim]No history recorded yet — run `arc pgdb migrate`.[/dim]")
         return
     for r in rows:
         console.print(
@@ -586,7 +586,7 @@ def clear(
     async def _do() -> None:
         for t in ordered:
             count = await arc.pgdb.clear(t)
-            console.print(f"  {t}: {count} row(s) cleared (recoverable via `arc psqldb trash`)")
+            console.print(f"  {t}: {count} row(s) cleared (recoverable via `arc pgdb trash`)")
 
     with _friendly_errors():
         arc.runtime.run_async(_do(), open=("pgdb",))
@@ -665,11 +665,11 @@ def backup(
 
 @app.command()
 def restore(
-    dump_file: Path = typer.Argument(..., help="A file produced by `arc psqldb backup`."),
+    dump_file: Path = typer.Argument(..., help="A file produced by `arc pgdb backup`."),
     plugin: str = typer.Option(None, "-p", "--plugin", help="Only restore this plugin's tables."),
     table: str = typer.Option(None, "-t", "--table", help="Only restore this one table."),
 ) -> None:
-    """pg_restore a dump produced by `arc psqldb backup`."""
+    """pg_restore a dump produced by `arc pgdb backup`."""
     root = _root_or_exit()
     if shutil.which("pg_restore") is None:
         err_console.print(
@@ -741,7 +741,7 @@ def trash_recover(
 ) -> None:
     """Recover a _trash entry: Row/Table entries are re-inserted as-is;
     a Column entry's snapshot is a jsonb ARRAY covering up to
-    psqldb.migrate.COLUMN_DROP_CHUNK_SIZE rows (one _trash entry = one
+    pgdb.migrate.COLUMN_DROP_CHUNK_SIZE rows (one _trash entry = one
     chunk of the dropped column, not one row) — recovering it updates
     every row in that chunk back onto its original row in one set-based
     UPDATE, not just a single row."""

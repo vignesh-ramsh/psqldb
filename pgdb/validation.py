@@ -1,5 +1,5 @@
 """
-psqldb.validation
+pgdb.validation
 -------------------
 App-tier field validation — for the types that have no DB-level guarantee
 (fields.APP_VALIDATED_TYPES): EMAIL, PHONE, SELECT, TABLE. REFERENCE needs
@@ -52,7 +52,7 @@ def validate_row(schema: TableSchema, data: dict[str, Any]) -> None:
 
 def validate_columns_known(schema: TableSchema, data: dict[str, Any]) -> None:
     """Every key in `data` must be a real column on `schema`. insert()/
-    update() (psqldb/__init__.py) build SQL identifiers directly from these
+    update() (pgdb/__init__.py) build SQL identifiers directly from these
     keys (`f'"{col}"'`) — an unknown key isn't just a typo worth a clear
     error, it's an unvalidated string about to be interpolated into a SQL
     identifier position. The Query Engine (relay/query.py) already
@@ -71,13 +71,13 @@ def friendly_fk_error(exc: Exception, *, table: str) -> ValidationError:
     """Translates asyncpg's ForeignKeyViolationError into the same
     ValidationError shape validate_row already raises. Replaces a separate
     pre-check SELECT per REFERENCE field that used to run before every
-    insert/update (psqldb/__init__.py) — the DB already enforces this via
-    the real FK constraint (ON DELETE RESTRICT, psqldb.ddl), so the
+    insert/update (pgdb/__init__.py) — the DB already enforces this via
+    the real FK constraint (ON DELETE RESTRICT, pgdb.ddl), so the
     pre-check was a redundant round-trip; catching the real violation
     instead costs nothing on the success path, which is the common case.
 
     Constraint names for a REFERENCE column follow one deterministic
-    pattern (psqldb.ddl._user_column_sql's inline `REFERENCES` clause,
+    pattern (pgdb.ddl._user_column_sql's inline `REFERENCES` clause,
     never a named CONSTRAINT — Postgres auto-names it "{table}_{column}
     _fkey"), so this can usually name the offending field; falls back to
     Postgres's own `detail` message (always present) if the pattern

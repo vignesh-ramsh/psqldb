@@ -1,5 +1,5 @@
 """
-psqldb.model
+pgdb.model
 -------------------
 Loads one plugin's `schemas/*.json` directory into TableSchema objects.
 
@@ -7,7 +7,7 @@ Convention (business-plugin side): a plugin declares its own tables under
 `plugins/<name>/schemas/<Table Name>.json` — one file per table, filename
 (slugified) becomes the physical table name. A business plugin's register()
 calls `arc.pgdb.register_model(path_to_its_schemas_dir)` — see
-psqldb.migrate.ModelRegistry — which is how psqldb discovers what to diff
+pgdb.migrate.ModelRegistry — which is how pgdb discovers what to diff
 and apply, without ever importing a business plugin's Python code to do it.
 
 System-field injection (never declared by a business plugin):
@@ -17,15 +17,15 @@ System-field injection (never declared by a business plugin):
                     creation/update independently of the parent row; there
                     is no inheritance from the parent's own audit fields.
   * `"system": true` table: none of the above injected — the file declares
-    every field itself, exactly like psqldb's own _trash/_field_registry/
+    every field itself, exactly like pgdb's own _trash/_field_registry/
     _patch_history (which are raw SQL, not schema files, but the same
     "fully self-declared" idea). The ONE additional thing "system": true
     grants (on top of the exemption above, unchanged) is permission for the
     table's name to keep a leading `_` (see slugify_table_name below) —
-    reserved otherwise for psqldb's own internal tables.
+    reserved otherwise for pgdb's own internal tables.
 
 `_state` exists on every table (child tables included) because the soft-
-delete trigger (psqldb.ddl.SOFT_DELETE_TRIGGER_SQL) cascades a child's
+delete trigger (pgdb.ddl.SOFT_DELETE_TRIGGER_SQL) cascades a child's
 `_state` to 99 the same way it does the parent's — it needs the column to
 exist everywhere it might fire.
 """
@@ -54,7 +54,7 @@ class SchemaError(ValueError):
 
 # An index/unique_together "key" — same shape fields._NAME_RE already
 # enforces on a field name, applied here too: both end up interpolated
-# straight into a quoted SQL identifier by psqldb.ddl (CREATE INDEX
+# straight into a quoted SQL identifier by pgdb.ddl (CREATE INDEX
 # "{key}" / CONSTRAINT "{key}"), never as a parameter. A key containing a
 # literal `"` breaks out of that identifier position; a schema file is
 # normally developer-authored, but save_schema_file (admin's Schema
@@ -96,13 +96,13 @@ def slugify_table_name(filename_stem: str, *, system: bool = False) -> str:
     whatever physical table an existing schema already produced, so it must
     be able to reach an underscore-prefixed name too — this grants no new
     table-creation capability, since a patch aimed at a name nothing created
-    is just skipped with a warning (see psqldb.migrate).
+    is just skipped with a warning (see pgdb.migrate).
 
-    `_trash`/`_field_registry`/`_patch_history`/`_audit_*` are psqldb's own
-    internal tables, created via raw SQL directly in psqldb.ddl — they never
+    `_trash`/`_field_registry`/`_patch_history`/`_audit_*` are pgdb's own
+    internal tables, created via raw SQL directly in pgdb.ddl — they never
     go through this function at all, so this is a defensive collision guard
     against a THIRD-PARTY schema claiming one of those exact reserved names,
-    not something that governs psqldb's own bootstrap tables."""
+    not something that governs pgdb's own bootstrap tables."""
     raw = _SLUG_RE.sub("_", filename_stem.strip().lower())
     keep_prefix = system and raw.startswith("_")
     core = raw.strip("_")
@@ -126,7 +126,7 @@ def slugify_table_name(filename_stem: str, *, system: bool = False) -> str:
     if slug in _RESERVED_SYSTEM_TABLE_NAMES or slug.startswith("_audit_"):
         raise SchemaError(
             f"schema filename '{filename_stem}' produces table name "
-            f"'{slug}', which is reserved for psqldb's own internal "
+            f"'{slug}', which is reserved for pgdb's own internal "
             f"bookkeeping tables — choose a different name."
         )
     return slug
@@ -138,7 +138,7 @@ NORMAL_SYSTEM_FIELDS = [
     Field(id="_updated_at", name="updated_at", type="DATETIME"),
     # created_by/updated_by hold the acting user's EMAIL (a plain TEXT
     # column, rendered specially in ddl.py) — readable without a join, and
-    # psqldb never has to know a "users" table exists (§3.3). TEXT is a real
+    # pgdb never has to know a "users" table exists (§3.3). TEXT is a real
     # canonical type here (not a REFERENCE_* sentinel) so the Query Engine
     # can filter/order on these columns like any other.
     Field(id="_created_by", name="created_by", type="TEXT"),
@@ -177,7 +177,7 @@ class TableSchema:
     indexes: list[dict]
     system_fields: list[Field]  # already resolved for this table (empty if system=True or is_patch)
     is_patch: bool = False  # from plugins/<plugin>/patches/, not plugins/<plugin>/schemas/ —
-    # see psqldb.migrate: never creates its table (skip+warn if missing),
+    # see pgdb.migrate: never creates its table (skip+warn if missing),
     # diffed against ONLY the fields this same plugin already owns on that
     # table (never another plugin's, and never TABLE-typed/child fields)
     unique_together: list[dict] = dc_field(default_factory=list)  # [{"key": ..., "fields": [...]}, ...] —
@@ -188,7 +188,7 @@ class TableSchema:
     # a table, so it can't declare the table's own key either
     # (schema_spec.PatchFileSpec has no such field at all, rejected
     # structurally). Rendered as a real Postgres UNIQUE constraint and
-    # diffed like one — see psqldb.ddl/psqldb.migrate.
+    # diffed like one — see pgdb.ddl/pgdb.migrate.
 
     def all_fields(self) -> list[Field]:
         return [*self.system_fields, *self.fields]
@@ -205,7 +205,7 @@ class TableSchema:
         build_aggregate — once per call, every time) despite `fields`
         never changing after boot. Safe to cache on the instance itself
         because a TableSchema is immutable post-boot (frozen dataclass;
-        psqldb.schema()'s patch-merge path produces a distinct new
+        pgdb.schema()'s patch-merge path produces a distinct new
         instance via dataclasses.replace() rather than mutating this one,
         so a merged schema's cache is never shared with — or stale
         relative to — its base's)."""
@@ -319,7 +319,7 @@ def load_schema_file(path: Path, *, plugin: str) -> TableSchema:
     if not isinstance(raw, dict):
         raise SchemaError(f"{path}: schema file must be a JSON object.")
 
-    # Fast structural pre-check (psqldb.schema_spec) — a typo'd key, a wrong
+    # Fast structural pre-check (pgdb.schema_spec) — a typo'd key, a wrong
     # JSON type, or an unknown field `type` name fails HERE with one clear
     # message, before any of the field-by-field parsing below even starts.
     # Business rules (unique field required, primary_key is UUID-only, ...)
@@ -370,7 +370,7 @@ def load_schema_file(path: Path, *, plugin: str) -> TableSchema:
         )
 
     # A "system": true table gets no auto-injected id (system_fields is empty
-    # above) — it must self-declare exactly one primary_key field, which psqldb.ddl
+    # above) — it must self-declare exactly one primary_key field, which pgdb.ddl
     # then renders with the same arc_uuid_generate_v7() default a normal table's
     # auto-injected id gets. Any other table already has its id auto-injected, so
     # a second, hand-declared one would just be a dead/conflicting column.
@@ -423,7 +423,7 @@ def load_schemas_dir(schemas_dir: Path, *, plugin: str) -> list[TableSchema]:
 # Patches — plugins/<plugin>/patches/<Table Name>.json. Same file shape as
 # a schema minus "system"/"audit"/"child" (none apply — a patch never
 # declares a new table, only adds fields to / modifies fields it already
-# owns on one that exists). See psqldb.migrate for how these are diffed:
+# owns on one that exists). See pgdb.migrate for how these are diffed:
 # ownership-scoped to this same plugin, skip-with-warning if the target
 # table doesn't exist yet, and — unlike schemas — TABLE-typed (child-table)
 # fields are rejected outright, since a patch can't create a table at all.

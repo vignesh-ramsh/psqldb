@@ -1,8 +1,8 @@
 """
-psqldb.ddl
+pgdb.ddl
 -------------------
-Renders SQL text from a psqldb.model.TableSchema. Nothing in this module
-executes anything — it only produces strings, so `arc psqldb plan` can show
+Renders SQL text from a pgdb.model.TableSchema. Nothing in this module
+executes anything — it only produces strings, so `arc pgdb plan` can show
 exactly what would run without a DB connection touching real data.
 
 Three kinds of output:
@@ -26,7 +26,7 @@ from .model import CHILD_SYSTEM_FIELDS, NORMAL_SYSTEM_FIELDS, TableSchema
 @dataclass(frozen=True)
 class RefColumn:
     """What one REFERENCE field's target actually resolves to, once every
-    plugin's schemas are known — computed in psqldb.migrate.resolve_ref_columns
+    plugin's schemas are known — computed in pgdb.migrate.resolve_ref_columns
     (needs the full cross-plugin schema set, so it can't live on Field itself;
     see Field.target_field). `column`/`sql_type` are "id"/"UUID" for the
     default case (no target_field declared) — same shape either way so
@@ -56,8 +56,8 @@ def _system_column_sql(f: Field, *, parent_table: str | None) -> str:
     if f.id in ("_created_by", "_updated_by"):
         # Stores the acting user's EMAIL, not a UUID — readable without a
         # join to whatever users table (if any) exists. Nullable, no FK —
-        # psqldb doesn't know a "users" table exists (§3.3), which is also
-        # exactly why a UUID here was never resolvable at the psqldb layer.
+        # pgdb doesn't know a "users" table exists (§3.3), which is also
+        # exactly why a UUID here was never resolvable at the pgdb layer.
         return f'"{f.name}" TEXT'
     if f.id == "_state":
         return '"_state" INTEGER NOT NULL DEFAULT 0'
@@ -70,7 +70,7 @@ def _user_column_sql(
     if f.primary_key:
         # Same shape a normal table's auto-injected id gets (_system_column_sql's
         # "_id" branch above) — just self-declared, since a "system": true table
-        # has no auto-injected system_fields at all (psqldb.model). A PRIMARY KEY
+        # has no auto-injected system_fields at all (pgdb.model). A PRIMARY KEY
         # is already NOT NULL UNIQUE, and arc_uuid_generate_v7() is a function
         # call, not a literal, so this deliberately skips the generic
         # required/default/unique rendering below (_sql_literal would wrongly
@@ -78,7 +78,7 @@ def _user_column_sql(
         return f'"{f.name}" UUID PRIMARY KEY DEFAULT arc_uuid_generate_v7()'
     ref = ref_columns.get((owner_table, f.name)) if f.type == "REFERENCE" else None
     # `ref` is resolved (and, for a non-default target_field, validated as
-    # pointing at a real "unique": true column) by psqldb.migrate before this
+    # pointing at a real "unique": true column) by pgdb.migrate before this
     # ever runs — this function only renders, it never decides (module
     # docstring). f.sql_type() itself would silently be wrong here (always
     # "UUID" for REFERENCE — see Field.target_field's docstring), so a
@@ -114,8 +114,8 @@ def create_table_sql(
     """Returns the statements to create `schema` from nothing: the table,
     its indexes, and — for non-system tables — the soft-delete + updated_at
     triggers. A `"system": true` table self-declares its own structure
-    entirely (psqldb.model) and stays outside the automatic soft-delete/
-    audit machinery too, same as psqldb's own _trash/_field_registry/
+    entirely (pgdb.model) and stays outside the automatic soft-delete/
+    audit machinery too, same as pgdb's own _trash/_field_registry/
     _patch_history (raw SQL, never through this function, but the same
     "fully self-managed" idea)."""
     ref_columns = ref_columns or {}
@@ -176,8 +176,8 @@ def unique_together_sql(table: str, group: dict) -> str:
 
     Unlike index_sql's `CREATE INDEX IF NOT EXISTS`, Postgres has no `ADD
     CONSTRAINT IF NOT EXISTS` — this always renders the statement
-    unconditionally; psqldb.migrate only calls it for a group
-    psqldb.introspect.constraint_exists() has already confirmed is
+    unconditionally; pgdb.migrate only calls it for a group
+    pgdb.introspect.constraint_exists() has already confirmed is
     genuinely new, so idempotency is the caller's job, not this
     function's (same "renders, never decides" split every other function
     in this module already follows)."""
@@ -203,26 +203,26 @@ def trigger_attach_sql(table: str) -> list[str]:
 
 
 # ------------------------------------------------------------------------ #
-# Bootstrap. Split in two so a psqldb upgrade that fixes shared trigger
+# Bootstrap. Split in two so a pgdb upgrade that fixes shared trigger
 # logic actually reaches an already-bootstrapped project:
 #   * BOOTSTRAP_STRUCTURAL_SQL — extension + system tables. Only ever
 #     needed once; migrate.build_plan only includes it when _field_registry
 #     doesn't exist yet.
 #   * BOOTSTRAP_FUNCTIONS_SQL — the shared trigger functions, all
-#     CREATE OR REPLACE. Re-applied on EVERY `arc psqldb migrate`, so a
-#     newer psqldb version's fix to arc_soft_delete_to_trash (say) lands on
+#     CREATE OR REPLACE. Re-applied on EVERY `arc pgdb migrate`, so a
+#     newer pgdb version's fix to arc_soft_delete_to_trash (say) lands on
 #     the next migrate, not just on a brand new project.
 #
 # Known gap, not new: BOOTSTRAP_STRUCTURAL_SQL is CREATE TABLE IF NOT EXISTS
 # only — a project that already bootstrapped BEFORE a system table's own
 # shape changed here (e.g. _field_registry.ref_field, added for
-# target_field/§ psqldb.migrate.resolve_ref_columns) does NOT get that
-# column automatically; psqldb has no self-migration story for its OWN
+# target_field/§ pgdb.migrate.resolve_ref_columns) does NOT get that
+# column automatically; pgdb has no self-migration story for its OWN
 # system tables yet, only for business schemas. Until that exists, an
-# already-bootstrapped project picking up a psqldb change like this one
+# already-bootstrapped project picking up a pgdb change like this one
 # needs the ALTER run by hand once (e.g. `ALTER TABLE _field_registry ADD
 # COLUMN ref_field TEXT`). `precision`/`scale` (added alongside the DECIMAL
-# diffing fix, psqldb.migrate._diff_table) are the same class of change —
+# diffing fix, pgdb.migrate._diff_table) are the same class of change —
 # an already-bootstrapped project needs `ALTER TABLE _field_registry ADD
 # COLUMN precision INTEGER, ADD COLUMN scale INTEGER` run by hand once.
 # Existing DECIMAL fields already in the registry will read back NULL for
@@ -295,7 +295,7 @@ BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
     )
     """,
     # -- _unique_together: "the composite-unique groups as of the last
-    # successful migration" — the registry psqldb.migrate diffs a schema's
+    # successful migration" — the registry pgdb.migrate diffs a schema's
     # declared unique_together list against, the same role _field_registry
     # plays for individual fields. A separate table rather than more
     # _field_registry columns because a group spans MULTIPLE fields, not
@@ -346,13 +346,13 @@ BOOTSTRAP_FUNCTIONS_SQL: list[str] = [
     END;
     $$ LANGUAGE plpgsql VOLATILE
     """,
-    # Only bumps updated_at when the row actually changed — psqldb.update()
+    # Only bumps updated_at when the row actually changed — pgdb.update()
     # has no dirty-check of its own (it only guards "zero columns to set at
-    # all", psqldb/__init__.py), so a caller that saves a row with the
+    # all", pgdb/__init__.py), so a caller that saves a row with the
     # SAME values it already has used to still issue a real UPDATE that
     # unconditionally bumped updated_at (and, on an audited table, wrote a
     # before==after row to _audit_* — see arc_audit_{plugin} below, which
-    # this fix also protects). Every OTHER caller of psqldb.update() besides
+    # this fix also protects). Every OTHER caller of pgdb.update() besides
     # the one place that added its own client-side dirty-check would
     # reproduce that exact bug; fixing it here, in the one function every
     # non-system table's UPDATE already goes through, protects all of them
@@ -476,7 +476,7 @@ def audit_table_sql(plugin: str) -> list[str]:
             -- changed_by goes through the jsonb representation, not a direct
             -- NEW.updated_by/OLD.updated_by struct reference: this function is
             -- shared across every audited table for the plugin, and a
-            -- "system": true table (psqldb.model) self-declares its own
+            -- "system": true table (pgdb.model) self-declares its own
             -- columns — it has no auto-injected updated_by at all. ->>'key' on
             -- jsonb degrades to NULL when the key's absent instead of raising
             -- "record has no field", so this works for both table shapes

@@ -1,18 +1,18 @@
 """
-psqldb.fields
+pgdb.fields
 -------------------
-Canonical field types for a psqldb schema file. One type = one Postgres
+Canonical field types for a pgdb schema file. One type = one Postgres
 column shape, plus which tier enforces it:
 
   * DB tier    — a real Postgres type/constraint (STRING, INT, REFERENCE, ...).
-  * app tier   — no DB guarantee; checked in psqldb.validation before every
+  * app tier   — no DB guarantee; checked in pgdb.validation before every
                  write (EMAIL, PHONE, SELECT). SELECT is deliberately NOT a
                  Postgres ENUM or CHECK constraint — options are a business
                  rule, not a storage-engine rule, and the project's own call
                  was to keep that in the validation layer so options can
                  change without a migration.
 
-This module is Postgres-shaped on purpose (docs/arc.MD §3.4 addendum: psqldb
+This module is Postgres-shaped on purpose (docs/arc.MD §3.4 addendum: pgdb
 + relay are one opinionated pair, not a generic multi-backend abstraction).
 """
 
@@ -34,7 +34,7 @@ _NAME_RE = re.compile(r"^[a-z][a-z0-9_]*$")
 TYPE_ALIASES = {"DATA": "STRING"}
 
 # canonical type -> Postgres type template. TABLE has no column shape at all
-# — it's handled entirely in psqldb.model (a TABLE field generates a whole
+# — it's handled entirely in pgdb.model (a TABLE field generates a whole
 # separate child table, not a column on this one).
 _SQL_TEMPLATES: dict[str, str] = {
     "STRING": "VARCHAR({length})",
@@ -55,7 +55,7 @@ _SQL_TEMPLATES: dict[str, str] = {
     # FILE/MULTIFILE (docs/filer-attachment-storage-proposal.md) — deliberately
     # NOT relational: no `target` required (unlike REFERENCE/TABLE), no DB-level
     # foreign key. A FILE column stores a `filer` FilerFile.file_id (a fixed-
-    # shape opaque handle, not a UUID) — psqldb only owns the column shape;
+    # shape opaque handle, not a UUID) — pgdb only owns the column shape;
     # whether the value resolves to a real, servable file is validated at the
     # relay-hook layer (filer's own after_save/validate hooks), the same
     # "DB tier only enforces shape, app tier enforces meaning" split SELECT's
@@ -75,7 +75,7 @@ DEFAULT_STRING_LENGTH = 255
 
 class FieldError(ValueError):
     """A field declaration in a schema file is invalid — always a hard
-    `arc psqldb plan`/`migrate` failure, never silently coerced."""
+    `arc pgdb plan`/`migrate` failure, never silently coerced."""
 
 
 def normalize_type(raw: str, *, where: str) -> str:
@@ -108,7 +108,7 @@ class Field:
     required: bool = False
     unique: bool = False
     primary_key: bool = False  # UUID only (enforced in parse_field below); only valid
-    # on a "system": true schema (enforced in psqldb.model,
+    # on a "system": true schema (enforced in pgdb.model,
     # which is where "exactly one per schema" is checked too
     # — needs every field at once, not just this one).
     length: int | None = None
@@ -118,13 +118,13 @@ class Field:
     options: tuple[str, ...] | None = None  # SELECT only — a fixed choice list
     list: bool = True  # UI-only (admin's Data Browser table/list view, docs/
     # admin-ui-ux-review.md #4) — NOT a DDL/storage concern,
-    # psqldb.ddl never reads this. Default True so every
+    # pgdb.ddl never reads this. Default True so every
     # already-authored schema keeps showing every column
     # unless a plugin explicitly opts a field OUT (e.g. a
     # verbose JSON/MULTIFILE blob that's fine in the row
     # editor but clutters a table view of many rows).
     group: str | None = None  # UI-only, same posture as `list` above — never read
-    # by psqldb.ddl, purely a hint for admin's Row Editor
+    # by pgdb.ddl, purely a hint for admin's Row Editor
     # to section a long field list (docs/admin-ui-ux-review.md,
     # the same gap already named at §3.2/§7.1). None means
     # "ungrouped" — a schema that never sets this renders
@@ -138,7 +138,7 @@ class Field:
     # class's own sql_type() below always returns for
     # REFERENCE — that resolution needs every plugin's
     # schemas at once, so it can't happen on a single
-    # Field in isolation; see psqldb.migrate.resolve_ref_columns.
+    # Field in isolation; see pgdb.migrate.resolve_ref_columns.
 
     def is_column(self) -> bool:
         """False only for TABLE — it generates a child table, not a column
@@ -151,7 +151,7 @@ class Field:
         physical column type (that's resolved cross-schema, see
         target_field's docstring above) — callers that care about the real
         type for such a field must go through
-        psqldb.migrate.resolve_ref_columns instead of calling this directly."""
+        pgdb.migrate.resolve_ref_columns instead of calling this directly."""
         if not self.is_column():
             raise FieldError(f"field '{self.name}' (TABLE) has no column type.")
         template = _SQL_TEMPLATES[self.type]

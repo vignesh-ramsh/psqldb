@@ -1,15 +1,15 @@
 """
-psqldb.introspect
+pgdb.introspect
 -------------------
 Reads live state back out of Postgres. Two different things live here, on
 purpose:
 
-  * `_field_registry` rows — this is what the differ (psqldb.migrate) diffs
+  * `_field_registry` rows — this is what the differ (pgdb.migrate) diffs
     the declared schema AGAINST. It's the only place that remembers a
     field's stable `id`, which is what makes rename-detection possible;
     `information_schema` has no notion of it.
   * `information_schema` reads — a secondary cross-check only, to catch
-    drift (someone altered a table outside of `arc psqldb migrate`). Never
+    drift (someone altered a table outside of `arc pgdb migrate`). Never
     the primary source of truth for diffing.
 """
 
@@ -49,7 +49,7 @@ async def registry_rows(conn: Any, table: str) -> list[dict]:
 async def unique_together_rows(conn: Any, table: str) -> list[dict]:
     """Every _unique_together row for `table` — "the composite-unique
     groups as of the last successful migration", the registry
-    psqldb.migrate diffs a schema's declared groups against, the same role
+    pgdb.migrate diffs a schema's declared groups against, the same role
     registry_rows() plays for individual fields. Same not-bootstrapped-yet
     guard as registry_rows() and for the identical reason — see that
     function's own docstring."""
@@ -63,7 +63,7 @@ async def constraint_exists(conn: Any, table: str, constraint_name: str) -> bool
     """Whether a constraint (of any kind) already exists on `table` under
     this exact name — used to make adding a unique_together group
     idempotent. Unlike `CREATE INDEX IF NOT EXISTS`, Postgres has no `ADD
-    CONSTRAINT IF NOT EXISTS`; this is the check psqldb.migrate runs first
+    CONSTRAINT IF NOT EXISTS`; this is the check pgdb.migrate runs first
     so a re-migrate with an unchanged group renders no ALTER TABLE at all,
     rather than one that would fail with a duplicate-constraint error."""
     row = await conn.fetchval(
