@@ -583,6 +583,19 @@ class PgDbProvider:
         except Exception as exc:
             return {"ok": False, "error": str(exc), "pool": self.pool_stats()}
 
+    def metrics(self) -> dict:
+        """arc.metrics.collect()'s duck-typed hook. Deliberately NOT just
+        pool_stats() verbatim: arc.metrics.aggregate() sums every numeric
+        field across processes, which is exactly right for `size`/`idle`
+        (each worker's own pool, so the SUM is the real system-wide
+        open-connection count) but wrong for `min_size`/`max_size` — those
+        are static PER-WORKER CONFIGURATION, identical across every
+        worker, and summing 8 workers' identical max_size=5 into "40"
+        would be actively misleading rather than just unhelpful. `open`
+        (bool) is dropped by aggregate() automatically either way."""
+        stats = self.pool_stats()
+        return {"size": stats["size"], "idle": stats["idle"]}
+
     def pool_stats(self) -> dict:
         """Real pool saturation numbers — size/idle/min/max — or all-zero
         with `open` false if the pool hasn't been opened at all (never
