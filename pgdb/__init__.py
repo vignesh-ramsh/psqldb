@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import contextlib
 import logging
+import time
 from pathlib import Path
 from typing import Any, Callable
 from uuid import UUID
@@ -461,8 +462,16 @@ class PgDbProvider:
             # creation time (this callback's only ever called once per
             # connection, not per checkout), turned out to be a real,
             # severe bug found by this project's own failure-mode audit.
-            if self.slow_query_threshold_ms > 0:
-                conn.add_query_logger(self._log_slow_query)
+            # ALWAYS registered now, not just when slow_query_threshold_ms
+            # is set - arc.tracing's DB-query spans piggyback on this same
+            # hook (the one place every query funnels through regardless
+            # of entry point - the CRUD helpers call the raw connection
+            # directly in 13+ places, bypassing fetch/execute/etc.
+            # entirely) and need it firing on EVERY query, not just slow
+            # ones. _log_slow_query checks each concern's own enablement
+            # independently, per call - a couple of cheap comparisons per
+            # query, negligible next to real DB round-trip time.
+            conn.add_query_logger(self._log_slow_query)
 
         if self._pool is None:
             self._pool = await asyncpg.create_pool(
@@ -470,12 +479,13 @@ class PgDbProvider:
             )
 
     def _log_slow_query(self, record: Any) -> None:
-        """asyncpg's add_query_logger callback — `record` carries `.query`,
-        `.args`, `.elapsed` (seconds), `.exception` (see asyncpg's own
-        LoggedQuery). Fires for every query on this connection; the
-        threshold check happens here rather than by only registering the
-        logger conditionally per-query, since asyncpg has no cheaper way to
-        scope it and this check itself costs nothing."""
+        """asyncpg's add_query_logger callback - fires for EVERY query on
+        this connection regardless of entry point. Slow-query logging and
+        tracing each check their own enablement independently (this
+        method, and _maybe_trace_query below) since asyncpg has no
+        cheaper way to scope either one and both checks cost nothing."""
+        self._maybe_trace_query(record)
+
         elapsed_ms = record.elapsed * 1000
         if elapsed_ms < self.slow_query_threshold_ms:
             return
@@ -486,6 +496,58 @@ class PgDbProvider:
             self.slow_query_threshold_ms,
             query,
         )
+
+    def _maybe_trace_query(self, record: Any) -> None:
+        """A post-hoc span, reconstructed from record.elapsed after the
+        query already finished - asyncpg's query logger is a completion
+        callback, not a before/after wrap, so start_time/end_time are
+        computed here rather than the span opening before the query
+        starts. Accepted tradeoff for covering every query site
+        (including the CRUD helpers that bypass this class's own
+        fetch/execute/etc. methods and call the raw connection directly)
+        with this one hook instead of a much larger, riskier refactor.
+
+        Attribute is record.query ONLY, never record.args - args are
+        BOUND PARAMETERS and can carry real secret/PII values (a
+        password, a token, a DSN fragment); the query text alone (with
+        its placeholders, never the substituted values) is safe to ship
+        to a trace backend, the parameters are not.
+
+        Runs within the same async context the query itself executed in
+        (asyncpg invokes this callback synchronously, in the calling
+        task, immediately after the query completes) - so this
+        automatically becomes a child of whatever span was active there
+        (a relay call, the gateway root span) via OTel's own contextvar-
+        based propagation, no explicit parent-passing needed here.
+
+        Only creates a span when there's a REAL active parent — starting
+        one with no current span doesn't skip tracing, it silently opens
+        a brand-new, single-span trace (OTel's normal behavior when
+        nothing is currently being traced). This connection runs plenty
+        of queries with no request anywhere near them — pool setup at
+        connection-init, maintenance queries between checkouts, a lineup
+        worker's own housekeeping — and giving every one of those its
+        own standalone trace would flood a trace backend's UI with noise
+        that was never a real "trace" anyone would follow, burying the
+        traces that actually matter. Skipping here is silent and cheap:
+        just one more context check next to the tracer-is-None one
+        above."""
+        tracer = arc.tracing.get_tracer()
+        if tracer is None:
+            return
+        from opentelemetry import trace
+
+        if not trace.get_current_span().get_span_context().is_valid:
+            return
+        end_ns = time.time_ns()
+        start_ns = end_ns - int(record.elapsed * 1_000_000_000)
+        query = record.query if len(record.query) <= 500 else record.query[:500] + "…"
+        span = tracer.start_span(
+            "arc.pgdb.query", start_time=start_ns, attributes={"db.statement": query}
+        )
+        if record.exception is not None:
+            span.record_exception(record.exception)
+        span.end(end_time=end_ns)
 
     async def close(self) -> None:
         if self._pool is not None:
