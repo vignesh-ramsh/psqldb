@@ -96,7 +96,13 @@ async def bootstrap_applied(conn: Any) -> bool:
     old heuristic treated "_field_registry exists" as "bootstrap fully
     ran". The structural SQL itself is all CREATE ... IF NOT EXISTS, so
     re-running it whenever any one of these is missing is always safe."""
-    for table in ("_field_registry", "_trash", "_patch_history", "_unique_together"):
+    for table in (
+        "_field_registry",
+        "_trash",
+        "_patch_history",
+        "_unique_together",
+        "_routines_history",
+    ):
         if not await table_exists(conn, table):
             return False
     return True

@@ -262,6 +262,23 @@ BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
         PRIMARY KEY (plugin, "table", kind, reference)
     )
     """,
+    # -- _routines_history: which plugins/<name>/routines/*.py files have
+    # already run (pgdb.routines). One row per (plugin, routine file stem);
+    # `checksum` is the file's sha256 at the time it ran, so a later edit
+    # to an already-applied routine can be flagged instead of silently
+    # ignored. Like _unique_together below, a whole new table: an
+    # already-bootstrapped project picks it up on its next migrate
+    # (bootstrap_applied() checks for it by name).
+    """
+    CREATE TABLE IF NOT EXISTS _routines_history (
+        plugin      TEXT NOT NULL,
+        name        TEXT NOT NULL,
+        applied_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        duration    DOUBLE PRECISION NOT NULL,
+        checksum    TEXT NOT NULL,
+        PRIMARY KEY (plugin, name)
+    )
+    """,
     """
     CREATE TABLE IF NOT EXISTS _field_registry (
         id          TEXT NOT NULL,

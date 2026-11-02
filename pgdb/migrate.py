@@ -55,6 +55,8 @@ from dataclasses import field as dc_field
 from pathlib import Path
 from typing import Any, Literal
 
+import arc
+
 from . import ddl, introspect
 from .fields import Field
 from .model import SchemaError, TableSchema, load_schemas_dir
@@ -1060,7 +1062,8 @@ async def build_plan(
                 kind="create_table",
                 table="_bootstrap",
                 plugin="pgdb",
-                description="bootstrap: pgcrypto extension, _field_registry, _trash, _patch_history",
+                description="bootstrap: pgcrypto extension, _field_registry, _trash, "
+                "_patch_history, _routines_history",
                 sql=list(ddl.BOOTSTRAP_STRUCTURAL_SQL),
                 destructive=False,
             )
@@ -1428,6 +1431,82 @@ def migration_reference() -> str:
     for one `arc pgdb migrate` run — used both as the filename and as
     _patch_history.reference."""
     return dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
+
+
+# --------------------------------------------------------------------- #
+# Lifecycle events — emitted by EVERY path that applies a migration (the
+# `arc pgdb migrate` CLI and admin's "Apply Now"), through the two helpers
+# below, so the two can never drift apart. Subscribers use plain
+# `arc.events.on(...)` from a plugin's events.py.
+#
+#   pgdb.premigration   after the operator confirmed and the migration lock
+#                       is held, immediately BEFORE anything is applied.
+#                       The database still has the OLD shape.
+#   pgdb.postmigration  after everything applied and the lock was released.
+#                       Never fired for a migration that failed or was
+#                       aborted. The database has the NEW shape.
+#
+# Both fire only when there is real work (a real schema change, or pending
+# routines on the CLI) — a no-op or maintenance-only run is silent, or every
+# subscriber would wake on every deploy. A handler's failure is logged and
+# reported in the summary but never fails or vetoes the migration (see
+# arc.events.emit), so these are for reacting (enqueue a lineup job, clear a
+# cache, notify), not for gating.
+#
+# Payload (schema_version 1 — fields are only ever ADDED, never changed or
+# removed):
+#   schema_version  int
+#   source          "cli" | "admin"
+#   reference       the migration reference (also _patch_history.reference)
+#   plugin / table  the requested scope, or None for a system-wide run
+#   changes         [{plugin, table, kind, source, destructive, description}]
+#                   — the plan's real (non-maintenance) ops
+#   routines        [{plugin, name}] — the routines about to run (pre) /
+#                   that ran (post)
+# --------------------------------------------------------------------- #
+PRE_MIGRATION_EVENT = "pgdb.premigration"
+POST_MIGRATION_EVENT = "pgdb.postmigration"
+MIGRATION_EVENT_SCHEMA_VERSION = 1
+
+
+def migration_event_payload(
+    plan: MigrationPlan,
+    *,
+    source: Literal["cli", "admin"],
+    reference: str,
+    plugin: str | None = None,
+    table: str | None = None,
+    routines: list[Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "schema_version": MIGRATION_EVENT_SCHEMA_VERSION,
+        "source": source,
+        "reference": reference,
+        "plugin": plugin,
+        "table": table,
+        "changes": [
+            {
+                "plugin": op.plugin,
+                "table": op.table,
+                "kind": op.kind,
+                "source": op.source,
+                "destructive": op.destructive,
+                "description": op.description,
+            }
+            for op in plan.real_ops()
+        ],
+        "routines": [{"plugin": r.plugin, "name": r.name} for r in routines or []],
+    }
+
+
+async def emit_migration_event(name: str, payload: dict[str, Any]) -> dict[str, str]:
+    """arc.events.emit, plus a log line per failed handler. Returns the
+    {handler: "ok" | "error: ..."} map so a CLI can print a summary."""
+    results = await arc.events.emit(name, **payload)
+    for handler, outcome in results.items():
+        if outcome != "ok":
+            _logger.warning("%s handler %s: %s", name, handler, outcome)
+    return results
 
 
 def write_migration_file(

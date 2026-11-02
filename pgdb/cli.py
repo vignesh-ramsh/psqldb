@@ -33,7 +33,7 @@ import arc
 from arc.runtime import find_project_root
 from arc.settings import SettingsManager
 
-from . import DSN_KEY, migrate
+from . import DSN_KEY, migrate, routines
 
 app = typer.Typer(help="Commands for the pgdb provider.")
 trash_app = typer.Typer(help="Recover documents from _trash.")
@@ -418,6 +418,114 @@ def _write_local_schemas(root: Path) -> None:
     console.print(f"[dim]updated {settings_path}[/dim]")
 
 
+@contextlib.asynccontextmanager
+async def _hook_capabilities():
+    """Opens, for the lifetime of a migrate/routines run, the capabilities
+    a routine or a pgdb.premigration/postmigration handler can reasonably
+    expect to find open — redix, and lineup in producer mode — when they
+    are installed. pgdb itself is opened by run_async.
+
+    lineup is opened with open_producer(), not open(): enqueue works, but
+    the durable-job reaper does not start, so this short-lived process
+    never claims and runs another process's abandoned jobs mid-migration.
+    relay needs no open() for anything a routine does, and its own open()
+    starts a reaper for the same reason, so it is left as booted.
+
+    Best effort by design: a project without Redis running must still be
+    able to migrate. A capability that fails to open is reported here, and
+    only a routine/handler that actually uses it fails (loudly, at that
+    point) — the migration itself is never refused over it."""
+    closers: list[tuple[str, object]] = []
+    openers: list[tuple[str, str]] = [("redix", "open"), ("lineup", "open_producer")]
+    for name, open_method in openers:
+        if not hasattr(arc, name):
+            continue
+        capability = getattr(arc, name)
+        opener = getattr(capability, open_method, None)
+        if not callable(opener):
+            continue
+        try:
+            await opener()
+        except Exception as exc:  # noqa: BLE001 - reported below; migrate must not depend on redix/lineup
+            console.print(
+                f"[yellow]{name} could not be opened ({type(exc).__name__}: {exc}) — "
+                f"routines and migration hooks that use it will fail.[/yellow]"
+            )
+            continue
+        closers.append((name, getattr(capability, "close", None)))
+    try:
+        yield
+    finally:
+        for name, closer in reversed(closers):
+            if not callable(closer):
+                continue
+            try:
+                await closer()
+            except Exception as exc:  # noqa: BLE001 - a failed close must not mask the migrate result
+                console.print(f"[yellow]{name} did not close cleanly: {exc}[/yellow]")
+
+
+async def _pending_routines(conn, plugin: str | None) -> list[routines.Routine]:
+    """Routines a migrate would run now (scoped to `plugin` if given), after
+    refusing — before anything is applied — to start with a broken file.
+    Warns about already-applied routines whose file changed since."""
+    entries = routines.classify(
+        routines.discover(arc.pgdb.routine_dirs(), plugin=plugin),
+        await routines.applied_checksums(conn, allow_missing=True),
+    )
+    _warn_changed(entries)
+    broken = [e.routine for e in entries if e.status == "invalid"]
+    if broken:
+        for routine in broken:
+            err_console.print(f"Routine '{routine.plugin}/{routine.name}': {routine.problem}")
+        err_console.print("Fix the routine file(s) above — nothing was applied.")
+        raise typer.Exit(code=1)
+    return routines.pending(entries)
+
+
+def _warn_changed(entries: list[routines.RoutineEntry]) -> None:
+    for entry in entries:
+        if entry.status == "changed":
+            console.print(
+                f"[yellow]Routine '{escape(entry.routine.plugin)}/{escape(entry.routine.name)}' "
+                f"was edited after it ran — not run again. Add a new routine file for the "
+                f"change.[/yellow]"
+            )
+
+
+def _print_routine_start(routine: routines.Routine) -> None:
+    console.print(f"Running routine {escape(routine.plugin)}/{escape(routine.name)} ...")
+
+
+def _print_routine_done(routine: routines.Routine, duration: float) -> None:
+    console.print(f"  [green]done[/green] [dim]({duration:.2f}s)[/dim]")
+
+
+def _print_hook_summary(event: str, results: dict[str, str]) -> None:
+    """One line per event that actually had subscribers; nothing when none."""
+    if not results:
+        return
+    failed = {handler: outcome for handler, outcome in results.items() if outcome != "ok"}
+    ok_count = len(results) - len(failed)
+    console.print(f"[dim]{event}: {ok_count} handler(s) ok, {len(failed)} failed[/dim]")
+    for handler, outcome in failed.items():
+        console.print(f"  [yellow]{escape(handler)}: {escape(outcome)}[/yellow]")
+
+
+def _write_migration_files(
+    root: Path, target_plugins: set[str], the_plan: migrate.MigrationPlan, reference: str
+) -> None:
+    for plugin_name in sorted(target_plugins):
+        plugin_ops_plan = migrate.MigrationPlan(
+            ops=[op for op in the_plan.ops if op.plugin == plugin_name]
+        )
+        if plugin_ops_plan.has_real_changes():
+            path = migrate.write_migration_file(
+                root / "plugins" / plugin_name, plugin_name, plugin_ops_plan, reference
+            )
+            console.print(f"[dim]wrote {path}[/dim]")
+
+
 @app.command()
 def plan(
     plugin: str = typer.Option(
@@ -461,7 +569,9 @@ def migrate_(
             p.plugin for p in patches if not plugin or p.plugin == plugin
         }
         reference = migrate.migration_reference()
-        async with provider.acquire() as conn:
+        failure: routines.RoutineError | None = None
+        ran: list[routines.Routine] = []
+        async with _hook_capabilities(), provider.acquire() as conn:
             # Held for the WHOLE diff-then-apply window, not just apply_plan
             # — two replicas racing must not both diff against the same
             # "before" state and then both try to apply overlapping DDL.
@@ -473,7 +583,10 @@ def migrate_(
                 if plugin:
                     _scope_plan(the_plan, plugin)  # ops AND schemas — see _scope_plan
                 _print_plan(the_plan)
-                if not the_plan.has_real_changes():
+                # -t is a table scope; a routine belongs to a plugin, not a
+                # table, so a table-scoped migrate never runs routines.
+                to_run = [] if table else await _pending_routines(conn, plugin)
+                if not the_plan.has_real_changes() and not to_run:
                     if not the_plan.is_empty():
                         # Maintenance ops only (audit table/index/trigger
                         # self-healing, Op.maintenance's own docstring) —
@@ -487,16 +600,42 @@ def migrate_(
                 if not yes and not typer.confirm("Proceed?", default=False):
                     console.print("[dim]Aborted — nothing applied.[/dim]")
                     raise typer.Exit(code=1)
-                await migrate.apply_plan(conn, the_plan, reference=reference)
-        for plugin_name in sorted(target_plugins):
-            plugin_ops_plan = migrate.MigrationPlan(
-                ops=[op for op in the_plan.ops if op.plugin == plugin_name]
-            )
-            if plugin_ops_plan.has_real_changes():
-                path = migrate.write_migration_file(
-                    root / "plugins" / plugin_name, plugin_name, plugin_ops_plan, reference
+                event_args = {"reference": reference, "plugin": plugin, "table": table}
+                _print_hook_summary(
+                    migrate.PRE_MIGRATION_EVENT,
+                    await migrate.emit_migration_event(
+                        migrate.PRE_MIGRATION_EVENT,
+                        migrate.migration_event_payload(
+                            the_plan, source="cli", routines=to_run, **event_args
+                        ),
+                    ),
                 )
-                console.print(f"[dim]wrote {path}[/dim]")
+                if not the_plan.is_empty():
+                    await migrate.apply_plan(conn, the_plan, reference=reference)
+                try:
+                    ran = await routines.run_pending(
+                        conn, to_run, on_start=_print_routine_start, on_done=_print_routine_done
+                    )
+                except routines.RoutineError as exc:
+                    failure = exc
+            _write_migration_files(root, target_plugins, the_plan, reference)
+            if failure is None:
+                _print_hook_summary(
+                    migrate.POST_MIGRATION_EVENT,
+                    await migrate.emit_migration_event(
+                        migrate.POST_MIGRATION_EVENT,
+                        migrate.migration_event_payload(
+                            the_plan, source="cli", routines=ran, **event_args
+                        ),
+                    ),
+                )
+        if failure is not None:
+            err_console.print(str(failure))
+            err_console.print(
+                "Schema changes above were applied. This routine and any after it stay "
+                "pending — fix it, then re-run `arc pgdb migrate` (or `arc pgdb routines`)."
+            )
+            raise typer.Exit(code=1)
         return True
 
     with _friendly_errors():
@@ -506,6 +645,109 @@ def migrate_(
 
 
 app.command(name="migrate")(migrate_)
+
+
+@app.command(name="routines")
+def routines_cmd(
+    plugin: str = typer.Option(None, "-p", "--plugin", help="Only this plugin's routines."),
+    status: bool = typer.Option(
+        False, "--status", help="List every routine and whether it is pending/applied/changed."
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run", help="List the routines that would run; run nothing."
+    ),
+    mark_applied: str = typer.Option(
+        None,
+        "--mark-applied",
+        help="Record this routine (file name, with or without .py) as applied WITHOUT running "
+        "it — for work already done by hand. Requires -p.",
+    ),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Skip the confirmation prompt."),
+) -> None:
+    """Run the pending routines (plugins/<name>/routines/*.py) without
+    touching the schema — the same step `arc pgdb migrate` runs after its
+    schema step. Each routine runs once, in order, and the first failure
+    stops the run. Does not emit pgdb.premigration/postmigration; re-run
+    `arc pgdb migrate` if hooks should fire."""
+    _root_or_exit()
+
+    async def _do() -> None:
+        provider = arc.pgdb
+        async with _hook_capabilities(), provider.acquire() as conn:
+            async with migrate.migration_lock(conn):
+                discovered = routines.discover(provider.routine_dirs(), plugin=plugin)
+                entries = routines.classify(discovered, await routines.applied_checksums(conn))
+                if status:
+                    _print_routine_status(entries)
+                    return
+                if mark_applied:
+                    await _mark_routine_applied(conn, entries, plugin, mark_applied)
+                    return
+                _warn_changed(entries)
+                to_run = routines.pending(entries)
+                broken = [r for r in to_run if r.state == "invalid"]
+                for routine in broken:
+                    err_console.print(
+                        f"Routine '{routine.plugin}/{routine.name}': {routine.problem}"
+                    )
+                if broken:
+                    raise typer.Exit(code=1)
+                if not to_run:
+                    console.print("[dim]No pending routines.[/dim]")
+                    return
+                for routine in to_run:
+                    console.print(f"  pending  {escape(routine.plugin)}/{escape(routine.name)}")
+                if dry_run:
+                    return
+                if not yes and not typer.confirm("Run these routines?", default=False):
+                    console.print("[dim]Aborted — nothing run.[/dim]")
+                    raise typer.Exit(code=1)
+                try:
+                    await routines.run_pending(
+                        conn, to_run, on_start=_print_routine_start, on_done=_print_routine_done
+                    )
+                except routines.RoutineError as exc:
+                    err_console.print(str(exc))
+                    err_console.print("This routine and any after it stay pending.")
+                    raise typer.Exit(code=1) from exc
+                console.print("[bold green]Routines complete.[/bold green]")
+
+    with _friendly_errors():
+        try:
+            arc.runtime.run_async(_do(), open=("pgdb",))
+        except routines.RoutineError as exc:
+            err_console.print(str(exc))
+            raise typer.Exit(code=1) from exc
+
+
+def _print_routine_status(entries: list[routines.RoutineEntry]) -> None:
+    if not entries:
+        console.print("[dim]No routines registered.[/dim]")
+        return
+    for entry in entries:
+        routine = entry.routine
+        detail = f"  [dim]{escape(routine.problem)}[/dim]" if routine.problem else ""
+        console.print(
+            f"{entry.status:<9} {escape(routine.plugin):<16} {escape(routine.name)}{detail}"
+        )
+
+
+async def _mark_routine_applied(
+    conn, entries: list[routines.RoutineEntry], plugin: str | None, name: str
+) -> None:
+    if not plugin:
+        err_console.print("--mark-applied requires -p/--plugin.")
+        raise typer.Exit(code=1)
+    stem = name.removesuffix(".py")
+    match = next((e for e in entries if e.routine.name == stem), None)
+    if match is None:
+        err_console.print(f"No routine '{stem}' registered for plugin '{plugin}'.")
+        raise typer.Exit(code=1)
+    if match.status not in ("pending", "invalid"):
+        err_console.print(f"Routine '{plugin}/{stem}' is already {match.status}.")
+        raise typer.Exit(code=1)
+    await routines.mark_applied(conn, match.routine)
+    console.print(f"Marked {plugin}/{stem} as applied (not run).")
 
 
 @app.command()

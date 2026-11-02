@@ -139,6 +139,10 @@ class PgDbProvider:
         # authored later via admin's Schema Builder) is still watched.
         self._model_dirs: list[tuple[str, Path]] = []
         self._patch_dirs: list[tuple[str, Path]] = []
+        # (plugin, directory) pairs from register_routines(), in the order
+        # plugins registered — i.e. boot (`requires`) order, which is the
+        # order routines run across plugins (pgdb/routines.py).
+        self._routine_dirs: list[tuple[str, Path]] = []
         # Post-boot memoization: schemas/patches are immutable once every
         # plugin's register() has run, but schema() (a patch merge) and
         # ref_targets()/ref_columns() (a walk over EVERY plugin's every
@@ -228,6 +232,20 @@ class PgDbProvider:
 
     def patches(self) -> list[TableSchema]:
         return list(self._patches)
+
+    # ------------------------------------------------------------------ #
+    # Routine registration — `arc.pgdb.register_routines(Path(__file__).parent.parent / "routines")`.
+    # Run-once Python setup/seed work; see pgdb/routines.py for the rules.
+    # Only records the directory (attributed to the registering plugin) —
+    # nothing is imported or run until `arc pgdb migrate` / `arc pgdb
+    # routines`.
+    # ------------------------------------------------------------------ #
+    def register_routines(self, routines_dir: str | Path) -> None:
+        plugin = self._kernel.current_plugin() or "<direct>"
+        self._routine_dirs.append((plugin, Path(routines_dir)))
+
+    def routine_dirs(self) -> list[tuple[str, Path]]:
+        return list(self._routine_dirs)
 
     def _invalidate_schema_caches(self) -> None:
         self._schema_cache.clear()
@@ -487,7 +505,13 @@ class PgDbProvider:
         self._maybe_trace_query(record)
 
         elapsed_ms = record.elapsed * 1000
-        if elapsed_ms < self.slow_query_threshold_ms:
+        # slow_query_threshold_ms<=0 must mean "disabled" — its own declared
+        # doc says exactly that ("0 disables slow-query logging") — but
+        # elapsed_ms is never negative, so `elapsed_ms < 0` was never true
+        # and every query fell through to the warning below regardless of
+        # this setting. Verified directly: at the documented default (0),
+        # this logged a warning for literally every query ever run.
+        if self.slow_query_threshold_ms <= 0 or elapsed_ms < self.slow_query_threshold_ms:
             return
         query = record.query if len(record.query) <= 500 else record.query[:500] + "…"
         _logger.warning(
