@@ -124,7 +124,7 @@ def setup() -> None:
 
     mgr.set(DSN_KEY, dsn, secret=True)
     console.print(f"[bold green]Connected[/bold green] — {version}")
-    console.print(f"[dim]Saved to {DSN_KEY} (encrypted, .arc/arc.secrets).[/dim]")
+    console.print(f"[dim]Saved to {DSN_KEY} (encrypted, .arc/arc.store.db).[/dim]")
     console.print(
         "[dim]Next: `arc pgdb migrate` to create tables in this database.[/dim]"
     )
