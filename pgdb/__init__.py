@@ -19,6 +19,7 @@ Gateway/arc.health design, not to this plugin.
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
 import time
@@ -29,8 +30,9 @@ from uuid import UUID
 import asyncpg
 
 import arc  # arc.codec is stateless and importable pre-boot — same pattern relay/gateway use
+from arc import sizing
 
-from . import fields, migrate, validation  # noqa: F401 - re-exported as arc.pgdb.fields / .migrate / .validation
+from . import budget, fields, migrate, validation  # noqa: F401 - re-exported as arc.pgdb.fields / .migrate / .validation
 from .model import (  # noqa: F401
     SchemaError,
     TableSchema,
@@ -52,6 +54,19 @@ POOL_ACQUIRE_TIMEOUT_MS_KEY = "pgdb_pool_acquire_timeout_ms"
 IDLE_IN_TRANSACTION_TIMEOUT_MS_KEY = "pgdb_idle_in_transaction_timeout_ms"
 
 _logger = logging.getLogger("pgdb")
+
+
+class PoolExhausted(TimeoutError):
+    """No database connection became available: the pool is full and stayed full for
+    `pgdb_pool_acquire_timeout_ms`, or PostgreSQL itself refused a new connection (it is
+    at its limit). The caller did nothing wrong and a retry in a moment will usually work, so
+    an HTTP request gets a 503 with Retry-After (the gateway reads `http_status` and
+    `retry_after` off the exception; it does not know about Postgres) instead of a 500.
+
+    A TimeoutError so everything that already catches the old bare timeout keeps working."""
+
+    http_status = 503
+    retry_after = 2
 
 # Only the fields the DB (or the CRUD helpers themselves) always supplies a
 # correct value for get silently stripped from a caller's insert()/update()
@@ -88,6 +103,9 @@ def _as_dicts(records: list[asyncpg.Record]) -> list[dict]:
 # the true ceiling, not flush against it, purely for headroom.
 _MAX_BIND_PARAMS = 32_000
 
+#: The least time a connection is given to be cleaned up and returned to the pool.
+_RELEASE_TIMEOUT_SECONDS = 10.0
+
 
 def _chunk_rows(rows: list, params_per_row: int) -> list[list]:
     """Splits `rows` into groups that each stay under _MAX_BIND_PARAMS once
@@ -117,9 +135,18 @@ class PgDbProvider:
         statement_timeout_ms: int = 30_000,
         pool_acquire_timeout_ms: int = 10_000,
         idle_in_transaction_timeout_ms: int = 60_000,
+        role: str | None = None,
+        plan: "sizing.ConnectionPlan | None" = None,
+        size_source: str = "setting pgdb_pool_max_size",
+        connection_budget: int = 0,
     ) -> None:
         self._kernel = kernel
         self.dsn = dsn
+        #: which kind of ARC process this is (gateway-worker, lineup-worker, ...), if it was told
+        self.role = role
+        self._plan = plan
+        self.size_source = size_source
+        self._connection_budget = connection_budget
         self.min_size = min_size
         self.max_size = max_size
         # 0 disables each — a deliberate, explicit opt-out, not a magic
@@ -492,9 +519,35 @@ class PgDbProvider:
             conn.add_query_logger(self._log_slow_query)
 
         if self._pool is None:
+            await self._fit_pool_to_server()
             self._pool = await asyncpg.create_pool(
                 self.dsn, min_size=self.min_size, max_size=self.max_size, init=_init_connection
             )
+
+    async def _fit_pool_to_server(self) -> None:
+        """Before the pool exists: if this process's size came from a deployment plan, check the
+        plan still fits what PostgreSQL allows NOW (its limit may have been lowered since) and,
+        if not, shrink to the share the same planner gives this role. One short connection and
+        one query, once per process start. Never stops a process from starting: if the server can't
+        be asked, the planned size stands."""
+        if self._plan is None or self.role is None or self.size_source != budget.PLAN_SOURCE:
+            return
+        try:
+            limits = await budget.fetch_limits_for_dsn(self.dsn)
+        except Exception as exc:  # noqa: BLE001 - this is a safety check, not a gate
+            _logger.debug("pgdb: could not read PostgreSQL's connection limits (%r); keeping the planned pool", exc)
+            return
+        usable = budget.usable_connections(limits, self._connection_budget)
+        fitted = sizing.fit_pool_to_server(self._plan, self.role, usable)
+        if fitted < self.max_size:
+            _logger.warning(
+                "pgdb: this deployment was planned for %d connections but PostgreSQL now allows %d "
+                "(%d reserved) — shrinking this %s process's pool from %d to %d. "
+                "Run `arc deploy` again to re-plan.",
+                self._plan.total, usable, self._plan.reserve, self.role, self.max_size, fitted,
+            )
+            self.max_size = fitted
+            self.min_size = min(self.min_size, fitted)
 
     def _log_slow_query(self, record: Any) -> None:
         """asyncpg's add_query_logger callback - fires for EVERY query on
@@ -629,7 +682,18 @@ class PgDbProvider:
 
     @contextlib.asynccontextmanager
     async def _acquire_cm(self, timeout: float | None):
-        async with self._pool.acquire(timeout=timeout) as conn:
+        try:
+            conn = await self._pool.acquire(timeout=timeout)
+        except (asyncio.TimeoutError, asyncpg.TooManyConnectionsError) as exc:
+            stats = self.pool_stats()
+            raise PoolExhausted(
+                f"no database connection available"
+                + (f" within {timeout:g}s" if isinstance(exc, asyncio.TimeoutError) and timeout else "")
+                + f" (this process's pool: {stats['size']} open of {stats['max_size']} allowed"
+                + (", PostgreSQL refused another connection: it is at its limit" if isinstance(exc, asyncpg.TooManyConnectionsError) else "")
+                + ")"
+            ) from exc
+        try:
             # Plain `SET`, not `set_config()` — see this method's own
             # docstring for why that distinction, on its own, does NOT fix
             # the underlying bug (both were tried; only re-applying on
@@ -645,6 +709,13 @@ class PgDbProvider:
                     f"SET idle_in_transaction_session_timeout = {int(self.idle_in_transaction_timeout_ms)}"
                 )
             yield conn
+        finally:
+            # asyncpg's release() defaults its budget to the ACQUIRE timeout, so a short acquire timeout
+            # (a busy pool answering fast with a 503 is the point of it) would also make the connection's
+            # own cleanup fail with TimeoutError, i.e. a 500 for a request whose work had succeeded.
+            await self._pool.release(
+                conn, timeout=None if timeout is None else max(timeout, _RELEASE_TIMEOUT_SECONDS)
+            )
 
     async def execute(self, query: str, *params: Any) -> str:
         async with self.acquire() as conn:
@@ -1192,6 +1263,28 @@ def register(kernel: Any) -> None:
         doc="Maximum size of the asyncpg connection pool.",
     )
     kernel.settings.declare(
+        budget.BUDGET_KEY,
+        type=int,
+        default=0,
+        doc="Total database connections ARC may use. 0 (default) = work it out from PostgreSQL: "
+        "max_connections minus its superuser reserve, and the role's and database's own connection "
+        "limits. Set it when those are not the real limit — behind PgBouncer, or on a managed "
+        "database that hides them.",
+    )
+    kernel.settings.declare(
+        budget.RESERVE_KEY,
+        type=int,
+        default=sizing.DEFAULT_CONNECTION_RESERVE,
+        doc="Connections kept free for everything that isn't a long-running ARC process: "
+        "migrations, `arc console`, backups, an administrator's psql, other applications.",
+    )
+    kernel.settings.declare(
+        budget.PLAN_KEY,
+        default="",
+        doc="Written by `arc deploy`: how many connections each kind of process may use, and the "
+        "limit it was planned against. Don't edit; set pgdb_pool_max_size_<role> to override one role.",
+    )
+    kernel.settings.declare(
         SLOW_QUERY_THRESHOLD_MS_KEY,
         type=int,
         default=0,
@@ -1229,7 +1322,17 @@ def register(kernel: Any) -> None:
         )
 
     min_size = kernel.settings.get(POOL_MIN_SIZE_KEY)
-    max_size = kernel.settings.get(POOL_MAX_SIZE_KEY)
+    # Which kind of process is this, and what pool should it have? An operator's per-role setting
+    # beats the deployment's plan, which beats the global default (budget.resolve_pool_size).
+    role = budget.role_from_environment()
+    plan = sizing.ConnectionPlan.from_json(budget.plan_text(kernel.settings.get(budget.PLAN_KEY)))
+    max_size, size_source = budget.resolve_pool_size(
+        role,
+        get=kernel.settings.get,
+        plan=plan,
+        global_size=kernel.settings.get(POOL_MAX_SIZE_KEY),
+    )
+    min_size = min(min_size, max_size)
     slow_query_threshold_ms = kernel.settings.get(SLOW_QUERY_THRESHOLD_MS_KEY)
     statement_timeout_ms = kernel.settings.get(STATEMENT_TIMEOUT_MS_KEY)
     pool_acquire_timeout_ms = kernel.settings.get(POOL_ACQUIRE_TIMEOUT_MS_KEY)
@@ -1244,6 +1347,10 @@ def register(kernel: Any) -> None:
         statement_timeout_ms=statement_timeout_ms,
         pool_acquire_timeout_ms=pool_acquire_timeout_ms,
         idle_in_transaction_timeout_ms=idle_in_transaction_timeout_ms,
+        role=role,
+        plan=plan,
+        size_source=size_source,
+        connection_budget=kernel.settings.get(budget.BUDGET_KEY) or 0,
     )
     kernel.export(CAPABILITY, provider, requires=[], optional_requires=[])
     # system.reload -> full re-scan of every registered schemas/patches
