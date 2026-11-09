@@ -1245,7 +1245,12 @@ class PgDbProvider:
 
 
 def register(kernel: Any) -> None:
-    kernel.settings.declare(DSN_KEY, secret=True)
+    kernel.settings.declare(
+        DSN_KEY, secret=True,
+        doc="The address of the PostgreSQL database ARC uses, written like "
+        "`postgresql://user:password@host:5432/database`. It contains the password, so it is kept as a secret. "
+        "ARC cannot start without it.",
+    )
     # Typed declare (§1 P0, Improvement Doc's own example key): get() below
     # now returns a real int, defaulting to 1/10 when unset, and a bad
     # value (non-numeric, hand-edited arc.toml) fails at arc.boot() with a
@@ -1254,64 +1259,66 @@ def register(kernel: Any) -> None:
         POOL_MIN_SIZE_KEY,
         type=int,
         default=1,
-        doc="Minimum size of the asyncpg connection pool.",
+        doc="The fewest database connections one ARC process keeps open and ready.",
     )
     kernel.settings.declare(
         POOL_MAX_SIZE_KEY,
         type=int,
         default=10,
-        doc="Maximum size of the asyncpg connection pool.",
+        doc="The most database connections one ARC process keeps open (the size of its connection pool). `arc "
+        "deploy` may give each kind of process its own number.",
     )
     kernel.settings.declare(
         budget.BUDGET_KEY,
         type=int,
         default=0,
-        doc="Total database connections ARC may use. 0 (default) = work it out from PostgreSQL: "
-        "max_connections minus its superuser reserve, and the role's and database's own connection "
-        "limits. Set it when those are not the real limit — behind PgBouncer, or on a managed "
-        "database that hides them.",
+        doc="The total number of database connections ARC may use. `0` (the default) means ARC works it out from "
+        "PostgreSQL: its `max_connections` minus the ones kept for administrators, and the limits of the role "
+        "and the database. Set it yourself when those numbers are not the real limit, for example behind "
+        "PgBouncer or on a managed database that hides them.",
     )
     kernel.settings.declare(
         budget.RESERVE_KEY,
         type=int,
         default=sizing.DEFAULT_CONNECTION_RESERVE,
-        doc="Connections kept free for everything that isn't a long-running ARC process: "
-        "migrations, `arc console`, backups, an administrator's psql, other applications.",
+        doc="How many database connections to keep free for everything that is not a long-running ARC process: "
+        "migrations, `arc console`, backups, an administrator using psql, and other applications.",
     )
     kernel.settings.declare(
         budget.PLAN_KEY,
         default="",
-        doc="Written by `arc deploy`: how many connections each kind of process may use, and the "
-        "limit it was planned against. Don't edit; set pgdb_pool_max_size_<role> to override one role.",
+        doc="A note written by `arc deploy`: how many database connections each kind of process may use, and the "
+        "limit it was planned for. Do not edit it. To change the number for one kind of process, set "
+        "`pgdb_pool_max_size_<role>`.",
     )
     kernel.settings.declare(
         SLOW_QUERY_THRESHOLD_MS_KEY,
         type=int,
         default=0,
-        doc="Log a warning for any query slower than this many milliseconds. 0 disables slow-query logging.",
+        doc="Write a warning to the log for any database query that takes longer than this many milliseconds. 0 "
+        "(the default) turns slow-query logging off.",
     )
     kernel.settings.declare(
         STATEMENT_TIMEOUT_MS_KEY,
         type=int,
         default=30_000,
-        doc="Postgres statement_timeout applied to every pooled connection, in milliseconds. 0 disables it.",
+        doc="The longest one database query may run, in milliseconds (default 30000, which is 30 seconds). "
+        "PostgreSQL cancels a longer one. 0 turns the limit off.",
     )
     kernel.settings.declare(
         POOL_ACQUIRE_TIMEOUT_MS_KEY,
         type=int,
         default=10_000,
-        doc="Maximum time to wait for a connection to free up from the pool, in "
-        "milliseconds, before raising asyncio.TimeoutError instead of waiting "
-        "forever. 0 disables it (asyncpg's own default: wait indefinitely).",
+        doc="How long, in milliseconds, a request waits for a free database connection before giving up with an "
+        "error (default 10000, which is 10 seconds). 0 means wait for ever.",
     )
     kernel.settings.declare(
         IDLE_IN_TRANSACTION_TIMEOUT_MS_KEY,
         type=int,
         default=60_000,
-        doc="Postgres idle_in_transaction_session_timeout applied to every pooled "
-        "connection, in milliseconds — kills a transaction that's open but not "
-        "actively running a statement (an abandoned BEGIN, a hung task) instead "
-        "of letting it hold its connection and locks forever. 0 disables it.",
+        doc="How long, in milliseconds, a database transaction may sit open doing nothing before PostgreSQL ends "
+        "it (default 60000, which is 1 minute). It stops a stuck or forgotten transaction from holding a "
+        "connection and locks for ever. 0 turns it off.",
     )
 
     dsn = kernel.settings.get(DSN_KEY, reveal=True)
