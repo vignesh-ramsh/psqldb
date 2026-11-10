@@ -45,6 +45,12 @@ from .validation import ValidationError  # noqa: F401
 
 CAPABILITY = "pgdb"
 
+#: What PostgreSQL raises when a DELETE (here, the UPDATE of _state to 99 whose trigger deletes the row) hits a row
+#: another table still references. PostgreSQL 14 to 17 report ON DELETE RESTRICT as foreign_key_violation (23503);
+#: 18 reports it as restrict_violation (23001), a separate error class, so both are caught to keep the friendly
+#: "can't delete" error (validation.friendly_delete_fk_error) on every version.
+_DELETE_BLOCKED_ERRORS = (asyncpg.ForeignKeyViolationError, asyncpg.RestrictViolationError)
+
 DSN_KEY = "pgdb_dsn"
 POOL_MIN_SIZE_KEY = "pgdb_pool_min_size"
 POOL_MAX_SIZE_KEY = "pgdb_pool_max_size"
@@ -887,7 +893,7 @@ class PgDbProvider:
                         id,
                         deleted_by,
                     )
-            except asyncpg.ForeignKeyViolationError as exc:
+            except _DELETE_BLOCKED_ERRORS as exc:
                 raise validation.friendly_delete_fk_error(exc, table=table) from exc
 
     # ------------------------------------------------------------------ #
@@ -1104,7 +1110,7 @@ class PgDbProvider:
                         deleted_by,
                         ids,
                     )
-            except asyncpg.ForeignKeyViolationError as exc:
+            except _DELETE_BLOCKED_ERRORS as exc:
                 raise validation.friendly_delete_fk_error(exc, table=table) from exc
 
     async def get_many(self, table: str, ids: list[UUID], *, conn: Any = None) -> list[dict]:

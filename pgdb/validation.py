@@ -98,7 +98,9 @@ def friendly_fk_error(exc: Exception, *, table: str) -> ValidationError:
 
 
 def friendly_delete_fk_error(exc: Exception, *, table: str) -> ValidationError:
-    """Translates asyncpg's ForeignKeyViolationError raised while DELETING
+    """Translates asyncpg's ForeignKeyViolationError (or, on PostgreSQL 18,
+    RestrictViolationError: the same ON DELETE RESTRICT refusal under
+    another SQLSTATE) raised while DELETING
     from `table` (a real DELETE, or the arc_soft_delete_to_trash trigger's
     own internal DELETE once a soft-delete sets _state=99) — deliberately
     NOT friendly_fk_error above: that one's "{table}_{column}_fkey" naming
@@ -108,7 +110,7 @@ def friendly_delete_fk_error(exc: Exception, *, table: str) -> ValidationError:
     this one), so the same naming guess would either miss entirely or —
     worse — name the wrong field with the wrong ("references a row that
     doesn't exist") direction. Postgres's own `detail` ("Key (x)=(y) is
-    still referenced from table \"...\"") already says exactly what
+    still referenced from table \"...\""; 18 drops the word "still") already says exactly what
     happened; this just frames it instead of trying to out-guess it."""
     detail = getattr(exc, "detail", None) or str(exc)
     return ValidationError(f"'{table}': can't delete — {detail}")
