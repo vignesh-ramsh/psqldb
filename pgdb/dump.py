@@ -60,14 +60,39 @@ def require_tools(*names: str) -> None:
         )
 
 
+#: What each tool prints when the client is the wrong version, and what to do about it. PostgreSQL's tools refuse to
+#: dump a server newer than themselves, and a restore cannot read an archive made by newer tools; neither is fixed by
+#: retrying, only by installing client tools of the right version.
+_VERSION_HINTS = (
+    (
+        "server version mismatch",
+        "The PostgreSQL client tools are older than the server, and they refuse to dump a newer server. Install "
+        "postgresql-client-<the server's major version> (or newer); on Debian and Ubuntu that package comes from the "
+        "PostgreSQL apt repository.",
+    ),
+    (
+        "unsupported version",
+        "This archive was made by newer PostgreSQL tools than this pg_restore. Restore it with a pg_restore of the "
+        "same major version as the tool that made it, or newer.",
+    ),
+)
+
+
+def _version_hint(output: str) -> str:
+    return next((hint for marker, hint in _VERSION_HINTS if marker in output), "")
+
+
 def _run(argv: list[str], env: dict[str, str], what: str) -> subprocess.CompletedProcess:
     result = subprocess.run(argv, env=env, capture_output=True, text=True)
     if result.returncode != 0:
-        lines = [line.strip() for line in (result.stderr or result.stdout).splitlines() if line.strip()]
+        output = result.stderr or result.stdout
+        lines = [line.strip() for line in output.splitlines() if line.strip()]
         # the lines that say what went wrong, not the "errors ignored on restore: 3" summary after them
         errors = [line for line in lines if "error" in line.lower() and "ignored on restore" not in line]
         detail = errors[:4] or lines[-3:]
-        raise DumpError(f"{what} failed (exit {result.returncode}): " + (" | ".join(detail) or "no output"))
+        message = f"{what} failed (exit {result.returncode}): " + (" | ".join(detail) or "no output")
+        hint = _version_hint(output)
+        raise DumpError(message + (f"\n{hint}" if hint else ""))
     return result
 
 

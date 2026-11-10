@@ -18,7 +18,6 @@ import asyncio
 import contextlib
 import os
 import shutil
-import subprocess
 import time
 import warnings
 from pathlib import Path
@@ -876,7 +875,7 @@ def backup(
         argv += ["-t", t]
 
     console.print(f"[dim]$ {' '.join(argv)}[/dim]")
-    subprocess.run(argv, check=True, env=env)
+    _run_client_tool(argv, env, "pg_dump")
     console.print(f"[bold green]Backup written to {out}[/bold green]")
 
 
@@ -906,8 +905,18 @@ def restore(
     argv.append(str(dump_file))
 
     console.print(f"[dim]$ {' '.join(argv)}[/dim]")
-    subprocess.run(argv, check=True, env=env)
+    _run_client_tool(argv, env, "pg_restore")
     console.print("[bold green]Restore complete.[/bold green]")
+
+
+def _run_client_tool(argv: list[str], env: dict[str, str], what: str) -> None:
+    """Run pg_dump or pg_restore. When it fails, print what the tool said (with a hint for the usual cause, a client
+    older than the server) and exit 1, the same message `arc backup` gives, instead of a Python traceback."""
+    try:
+        pgdump._run(argv, env, what)
+    except pgdump.DumpError as exc:
+        err_console.print(escape(str(exc)))
+        raise typer.Exit(code=1) from None
 
 
 def _tables_for_scope(root: Path, plugin: str | None, table: str | None) -> list[str]:
