@@ -338,30 +338,49 @@ BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
 ]
 
 BOOTSTRAP_FUNCTIONS_SQL: list[str] = [
-    # UUID v7 (time-ordered: 48-bit millisecond timestamp prefix + random
-    # tail), not Postgres's built-in gen_random_uuid() (v4, fully random) —
-    # a v4 PK causes real B-tree fragmentation on every insert (each one
-    # lands on a random leaf page); v7 mostly appends, like a sequential
-    # int PK would, while keeping UUID's distributed-uniqueness property.
-    # Hand-rolled because this targets Postgres 14 — native uuidv7() only
-    # arrived in Postgres 18, and no third-party uuidv7 extension is
-    # installed here either (checked pg_extension directly). Isolated in
-    # its own function, re-applied every migrate like the others below, so
-    # a future move to a native/extension implementation is a one-line
-    # body swap with zero table DDL touched.
+    # UUID v7 (time-ordered: 48-bit millisecond timestamp prefix, then version, variant and a tail), not Postgres's
+    # built-in gen_random_uuid() (v4, fully random) — a v4 PK causes real B-tree fragmentation on every insert (each
+    # one lands on a random leaf page); v7 mostly appends, like a sequential int PK would, while keeping UUID's
+    # distributed-uniqueness property.
+    #
+    # Every table's `id` default, `_trash` and every `_audit_*` table call THIS function by name, which is why it
+    # exists as a function of its own and is never dropped: what is behind the name can change without touching a
+    # table. It is re-applied on every migrate, and the body is chosen then, by the server's version:
+    #   * PostgreSQL 18 and newer: native uuidv7(). About three times faster, and strictly increasing within a
+    #     session (the spare bits after the timestamp carry a counter), where the hand-rolled body below leaves ids
+    #     made in the same millisecond in random order. A plain `SELECT uuidv7()` in LANGUAGE sql can also be inlined
+    #     into the column default.
+    #   * Older servers (14 to 17 have no uuidv7()): the hand-rolled body, which needs pgcrypto for gen_random_bytes.
+    # A server upgraded in place (pg_upgrade) keeps the old body until the next migrate swaps it. Both are valid
+    # RFC 9562 version-7 ids with the timestamp in the same place, so arc.uuid7.extract_timestamp() reads either, and
+    # ids from before and after the swap sort together by time.
     """
-    CREATE OR REPLACE FUNCTION arc_uuid_generate_v7() RETURNS uuid AS $$
-    DECLARE
-        ts_ms bytea;
-        result bytea;
+    DO $arc_uuid_dispatch$
     BEGIN
-        ts_ms := substring(int8send(floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint) FROM 3 FOR 6);
-        result := ts_ms || gen_random_bytes(10);
-        result := set_byte(result, 6, (get_byte(result, 6) & 15) | 112);  -- version nibble = 7
-        result := set_byte(result, 8, (get_byte(result, 8) & 63) | 128);  -- variant bits
-        RETURN encode(result, 'hex')::uuid;
-    END;
-    $$ LANGUAGE plpgsql VOLATILE
+        IF current_setting('server_version_num')::int >= 180000 THEN
+            EXECUTE $arc_uuid_native$
+                CREATE OR REPLACE FUNCTION arc_uuid_generate_v7() RETURNS uuid AS $fn$
+                    SELECT uuidv7()
+                $fn$ LANGUAGE sql VOLATILE
+            $arc_uuid_native$;
+        ELSE
+            EXECUTE $arc_uuid_handrolled$
+                CREATE OR REPLACE FUNCTION arc_uuid_generate_v7() RETURNS uuid AS $fn$
+                DECLARE
+                    ts_ms bytea;
+                    result bytea;
+                BEGIN
+                    ts_ms := substring(int8send(floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint) FROM 3 FOR 6);
+                    result := ts_ms || gen_random_bytes(10);
+                    result := set_byte(result, 6, (get_byte(result, 6) & 15) | 112);  -- version nibble = 7
+                    result := set_byte(result, 8, (get_byte(result, 8) & 63) | 128);  -- variant bits
+                    RETURN encode(result, 'hex')::uuid;
+                END;
+                $fn$ LANGUAGE plpgsql VOLATILE
+            $arc_uuid_handrolled$;
+        END IF;
+    END
+    $arc_uuid_dispatch$
     """,
     # Only bumps updated_at when the row actually changed — pgdb.update()
     # has no dirty-check of its own (it only guards "zero columns to set at
