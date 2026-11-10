@@ -347,13 +347,18 @@ BOOTSTRAP_FUNCTIONS_SQL: list[str] = [
     # exists as a function of its own and is never dropped: what is behind the name can change without touching a
     # table. It is re-applied on every migrate, and the body is chosen then, by the server's version:
     #   * PostgreSQL 18 and newer: native uuidv7(). About three times faster, and strictly increasing within a
-    #     session (the spare bits after the timestamp carry a counter), where the hand-rolled body below leaves ids
-    #     made in the same millisecond in random order. A plain `SELECT uuidv7()` in LANGUAGE sql can also be inlined
-    #     into the column default.
-    #   * Older servers (14 to 17 have no uuidv7()): the hand-rolled body, which needs pgcrypto for gen_random_bytes.
-    # A server upgraded in place (pg_upgrade) keeps the old body until the next migrate swaps it. Both are valid
-    # RFC 9562 version-7 ids with the timestamp in the same place, so arc.uuid7.extract_timestamp() reads either, and
-    # ids from before and after the swap sort together by time.
+    #     session (the spare bits after the timestamp carry a counter). A plain `SELECT uuidv7()` in LANGUAGE sql can
+    #     also be inlined into the column default.
+    #   * Older servers (14 to 17 have no uuidv7()): a hand-rolled body, which needs pgcrypto for gen_random_bytes.
+    #     It puts the part of the current millisecond that has already passed into the 12 spare bits that follow
+    #     the version (RFC 9562, section 6.2, method 3), so ids made in one session come out in creation order, as
+    #     with the native function. Without that, the random bytes straight after the millisecond left about half of
+    #     the ids made within one millisecond sorting before the one made just ahead of them, which also made an
+    #     audit history read with ORDER BY id DESC occasionally wrong. The fraction has microsecond resolution, so
+    #     two ids made in the very same microsecond are the only ones left unordered.
+    # A server upgraded in place (pg_upgrade) keeps the old body until the next migrate swaps it. Every body is a
+    # valid RFC 9562 version-7 id with the millisecond timestamp in the same place, so arc.uuid7.extract_timestamp()
+    # reads any of them, and ids from before and after a swap sort together by time.
     """
     DO $arc_uuid_dispatch$
     BEGIN
@@ -367,12 +372,16 @@ BOOTSTRAP_FUNCTIONS_SQL: list[str] = [
             EXECUTE $arc_uuid_handrolled$
                 CREATE OR REPLACE FUNCTION arc_uuid_generate_v7() RETURNS uuid AS $fn$
                 DECLARE
-                    ts_ms bytea;
+                    micros bigint;
+                    frac integer;
                     result bytea;
                 BEGIN
-                    ts_ms := substring(int8send(floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint) FROM 3 FOR 6);
-                    result := ts_ms || gen_random_bytes(10);
-                    result := set_byte(result, 6, (get_byte(result, 6) & 15) | 112);  -- version nibble = 7
+                    micros := floor(extract(epoch FROM clock_timestamp()) * 1000000)::bigint;
+                    -- the part of this millisecond that has passed, as 12 bits (0 to 4095)
+                    frac := ((micros % 1000) * 4096) / 1000;
+                    result := substring(int8send(micros / 1000) FROM 3 FOR 6) || gen_random_bytes(10);
+                    result := set_byte(result, 6, 112 | (frac >> 8));   -- version 7 in the high nibble, then the top 4 bits
+                    result := set_byte(result, 7, frac & 255);          -- the low 8 bits of the fraction
                     result := set_byte(result, 8, (get_byte(result, 8) & 63) | 128);  -- variant bits
                     RETURN encode(result, 'hex')::uuid;
                 END;
