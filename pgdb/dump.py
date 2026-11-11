@@ -20,6 +20,7 @@ from pathlib import Path
 from urllib.parse import unquote, urlparse
 
 import asyncpg
+from arc import permissions
 
 
 class DumpError(RuntimeError):
@@ -100,6 +101,7 @@ def dump(dsn: str, out: Path, *, tables: Sequence[str] = ()) -> None:
     """pg_dump the database (or only `tables`) to `out` in the custom format (compressed, and what
     pg_restore needs for selective restores)."""
     require_tools("pg_dump")
+    permissions.ensure_private_file(out)  # holds every row, password hashes included
     args, dbname, env = connection_args(dsn)
     argv = ["pg_dump", "-Fc", "-f", str(out), *args, dbname]
     for table in tables:

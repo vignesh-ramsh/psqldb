@@ -29,8 +29,9 @@ from rich.console import Console
 from rich.markup import escape
 
 import arc
+from arc import permissions
 from arc.runtime import find_project_root
-from arc.settings import SettingsManager
+from arc.settings import SettingsManager, cli_actor
 
 from . import DSN_KEY, migrate, routines
 from . import dump as pgdump
@@ -122,7 +123,7 @@ def setup() -> None:
         console.print("[dim]Nothing saved — run `arc pgdb setup` again to retry.[/dim]")
         raise typer.Exit(code=1)
 
-    mgr.set(DSN_KEY, dsn, secret=True)
+    mgr.set(DSN_KEY, dsn, secret=True, updated_by=cli_actor())
     console.print(f"[bold green]Connected[/bold green] — {version}")
     console.print(f"[dim]Saved to {DSN_KEY} (encrypted, .arc/arc.store.db).[/dim]")
     console.print(
@@ -866,7 +867,10 @@ def backup(
 
         ts = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d%H%M%S")
         out = root / "backups" / "db" / f"{ts}.dump"
-    out.parent.mkdir(parents=True, exist_ok=True)
+    # A dump holds every row, password hashes included: its folder and the file are the owner's alone,
+    # and the file is made so BEFORE pg_dump opens it (it keeps the mode it finds).
+    permissions.create_private_dir(out.parent)
+    permissions.ensure_private_file(out)
 
     conn_args, dbname, env = _pg_connection_args(dsn)
     argv = ["pg_dump", "-Fc", "-f", str(out), *conn_args, dbname]
