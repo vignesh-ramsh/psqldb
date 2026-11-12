@@ -58,6 +58,7 @@ SLOW_QUERY_THRESHOLD_MS_KEY = "pgdb_slow_query_threshold_ms"
 STATEMENT_TIMEOUT_MS_KEY = "pgdb_statement_timeout_ms"
 POOL_ACQUIRE_TIMEOUT_MS_KEY = "pgdb_pool_acquire_timeout_ms"
 IDLE_IN_TRANSACTION_TIMEOUT_MS_KEY = "pgdb_idle_in_transaction_timeout_ms"
+TIMEOUTS_PER_CHECKOUT_KEY = "pgdb_timeouts_per_checkout"
 
 _logger = logging.getLogger("pgdb")
 
@@ -141,6 +142,7 @@ class PgDbProvider:
         statement_timeout_ms: int = 30_000,
         pool_acquire_timeout_ms: int = 10_000,
         idle_in_transaction_timeout_ms: int = 60_000,
+        timeouts_per_checkout: bool = False,
         role: str | None = None,
         plan: "sizing.ConnectionPlan | None" = None,
         size_source: str = "setting pgdb_pool_max_size",
@@ -161,6 +163,7 @@ class PgDbProvider:
         self.statement_timeout_ms = statement_timeout_ms
         self.pool_acquire_timeout_ms = pool_acquire_timeout_ms
         self.idle_in_transaction_timeout_ms = idle_in_transaction_timeout_ms
+        self.timeouts_per_checkout = timeouts_per_checkout
         self._pool: asyncpg.Pool | None = None
         self._schemas: list[TableSchema] = []
         self._by_table: dict[str, TableSchema] = {}
@@ -508,11 +511,11 @@ class PgDbProvider:
                 "SELECT set_config('TimeZone', $1, false)", str(arc.tz.server_timezone())
             )
             # statement_timeout/idle_in_transaction_session_timeout are
-            # DELIBERATELY NOT set here — see acquire()'s own docstring
-            # below for why applying them once, at physical-connection-
-            # creation time (this callback's only ever called once per
-            # connection, not per checkout), turned out to be a real,
-            # severe bug found by this project's own failure-mode audit.
+            # DELIBERATELY NOT set here with SET: a SET made in this
+            # callback is undone by asyncpg's reset when the connection
+            # goes back to the pool. They are the connection's startup
+            # settings instead (_startup_settings(), passed to
+            # create_pool below) — see acquire()'s docstring.
             # ALWAYS registered now, not just when slow_query_threshold_ms
             # is set - arc.tracing's DB-query spans piggyback on this same
             # hook (the one place every query funnels through regardless
@@ -527,8 +530,27 @@ class PgDbProvider:
         if self._pool is None:
             await self._fit_pool_to_server()
             self._pool = await asyncpg.create_pool(
-                self.dsn, min_size=self.min_size, max_size=self.max_size, init=_init_connection
+                self.dsn,
+                min_size=self.min_size,
+                max_size=self.max_size,
+                init=_init_connection,
+                server_settings=self._startup_settings() or None,
             )
+
+    def _startup_settings(self) -> dict[str, str]:
+        """The two timeouts as connection STARTUP settings (asyncpg `server_settings`), unless
+        `pgdb_timeouts_per_checkout` asks for them to be sent on every checkout instead. A value of
+        0 leaves that timeout to the server's own default. Startup settings are the connection's
+        defaults, so asyncpg's reset on release puts them back after a caller has changed them,
+        and they cost no round trip at all per checkout."""
+        if self.timeouts_per_checkout:
+            return {}
+        settings: dict[str, str] = {}
+        if self.statement_timeout_ms > 0:
+            settings["statement_timeout"] = str(int(self.statement_timeout_ms))
+        if self.idle_in_transaction_timeout_ms > 0:
+            settings["idle_in_transaction_session_timeout"] = str(int(self.idle_in_transaction_timeout_ms))
+        return settings
 
     async def _fit_pool_to_server(self) -> None:
         """Before the pool exists: if this process's size came from a deployment plan, check the
@@ -659,25 +681,29 @@ class PgDbProvider:
         client) can retry or surface it, instead of a coroutine (and the
         connection it's already holding) stuck forever.
 
-        Also (re-)applies statement_timeout/idle_in_transaction_session_timeout
-        on EVERY checkout, not once at physical-connection-creation time —
-        found by this project's own failure-mode audit to be the actual
-        fix a real bug needed, not a style choice. Setting these once in
-        the pool's own `init=` callback (asyncpg's `create_pool`, which
-        fires exactly once per physical connection, not per checkout)
-        reads back correctly from `SHOW statement_timeout` forever after —
-        but silently stops being ENFORCED the moment the connection has
-        been through one checkout/release cycle that included a write:
-        confirmed with a minimal, Arc-independent reproduction (a bare
-        asyncpg pool, an `init=` callback doing nothing but `SET
-        statement_timeout = 500`, one acquire to CREATE TABLE, a second
-        acquire to INSERT + `pg_sleep(2)` inside one transaction — the
-        sleep ran to completion every time, despite `SHOW
-        statement_timeout` correctly reporting 500ms throughout). Setting
-        it fresh on every acquire — the one pattern confirmed to work
-        reliably across repeated checkouts — costs one extra fast
-        round-trip per acquire, which is a genuinely small price for a
-        timeout that actually times out."""
+        statement_timeout and idle_in_transaction_session_timeout are the
+        connection's STARTUP settings (`server_settings`, see
+        _startup_settings()), so a checkout sends no statement for them.
+        That is deliberate and the reason is a real bug found by this
+        project's failure-mode audit: setting them once with a plain `SET`
+        in the pool's `init=` callback reads back correctly from `SHOW
+        statement_timeout` but stops being ENFORCED once the connection has
+        been through a checkout/release cycle that included a write
+        (reproduced with a bare asyncpg pool: init=SET statement_timeout =
+        500, one acquire to CREATE TABLE, a second to INSERT + pg_sleep(2)
+        in one transaction - the sleep ran to completion). Re-sending the
+        SETs on every checkout fixed it, at the price of two extra round
+        trips per checkout (measured: 423 us instead of 191 us for a bare
+        acquire). Startup settings fix it too, for free: they are the
+        connection's defaults, so they survive asyncpg's reset on release,
+        and a caller that changes one with SET gets the configured value
+        back at the next checkout. test_pgdb_checkout_timeouts.py and
+        test_failure_mode_query_layer.py pin all of this.
+
+        Behind a pooler that refuses startup settings (PgBouncer in
+        transaction mode, unless it lists them in ignore_startup_parameters)
+        set `pgdb_timeouts_per_checkout`: both are then sent with every
+        checkout in ONE statement (one round trip)."""
         if self._pool is None:
             raise RuntimeError(
                 "pgdb pool is not open — call `await arc.pgdb.open()` "
@@ -700,20 +726,20 @@ class PgDbProvider:
                 + ")"
             ) from exc
         try:
-            # Plain `SET`, not `set_config()` — see this method's own
-            # docstring for why that distinction, on its own, does NOT fix
-            # the underlying bug (both were tried; only re-applying on
-            # every acquire actually did). Safe without bind-parameter
-            # support (a `SET` utility statement doesn't accept `$1` for
-            # its value) only because both values are guaranteed real ints
-            # (arc.settings' own `type=int` declaration) validated `> 0`
-            # first — never user input, never string-interpolated.
-            if self.statement_timeout_ms > 0:
-                await conn.execute(f"SET statement_timeout = {int(self.statement_timeout_ms)}")
-            if self.idle_in_transaction_timeout_ms > 0:
-                await conn.execute(
-                    f"SET idle_in_transaction_session_timeout = {int(self.idle_in_transaction_timeout_ms)}"
-                )
+            if self.timeouts_per_checkout:
+                # Only for a pooler that refuses startup settings (see acquire()). A plain `SET`
+                # utility statement takes no bind parameters, which is safe here only because both
+                # values are real ints (the settings are declared type=int), never user input.
+                statements = [
+                    f"SET {name} = {int(value)}"
+                    for name, value in (
+                        ("statement_timeout", self.statement_timeout_ms),
+                        ("idle_in_transaction_session_timeout", self.idle_in_transaction_timeout_ms),
+                    )
+                    if value > 0
+                ]
+                if statements:
+                    await conn.execute("; ".join(statements))
             yield conn
         finally:
             # asyncpg's release() defaults its budget to the ACQUIRE timeout, so a short acquire timeout
@@ -1326,6 +1352,16 @@ def register(kernel: Any) -> None:
         "it (default 60000, which is 1 minute). It stops a stuck or forgotten transaction from holding a "
         "connection and locks for ever. 0 turns it off.",
     )
+    kernel.settings.declare(
+        TIMEOUTS_PER_CHECKOUT_KEY,
+        type=bool,
+        default=False,
+        doc="How the two time limits above reach PostgreSQL. Off (the default): they are set once, when a "
+        "connection is opened, at no cost per request. Turn it on only if the database is reached through a "
+        "connection pooler that refuses such start-up settings (PgBouncer in transaction mode, unless it ignores "
+        "them): both limits are then sent with every request, in one extra round trip. Takes effect the next "
+        "time the server starts.",
+    )
 
     dsn = kernel.settings.get(DSN_KEY, reveal=True)
     if dsn is None:
@@ -1350,6 +1386,7 @@ def register(kernel: Any) -> None:
     statement_timeout_ms = kernel.settings.get(STATEMENT_TIMEOUT_MS_KEY)
     pool_acquire_timeout_ms = kernel.settings.get(POOL_ACQUIRE_TIMEOUT_MS_KEY)
     idle_in_transaction_timeout_ms = kernel.settings.get(IDLE_IN_TRANSACTION_TIMEOUT_MS_KEY)
+    timeouts_per_checkout = kernel.settings.get(TIMEOUTS_PER_CHECKOUT_KEY)
 
     provider = PgDbProvider(
         kernel,
@@ -1360,6 +1397,7 @@ def register(kernel: Any) -> None:
         statement_timeout_ms=statement_timeout_ms,
         pool_acquire_timeout_ms=pool_acquire_timeout_ms,
         idle_in_transaction_timeout_ms=idle_in_transaction_timeout_ms,
+        timeouts_per_checkout=timeouts_per_checkout,
         role=role,
         plan=plan,
         size_source=size_source,
