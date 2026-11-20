@@ -27,19 +27,21 @@ Two declaration sources, one diff engine:
     error raised BEFORE any SQL runs — the existing table/field is always
     left untouched, never dropped or silently adopted.
 
-Deliberate simplifications for this first cut (not oversights — narrower
-than the full design on purpose, safe to widen later without a schema
-change):
+Deliberate simplifications (not oversights — narrower than the full design
+on purpose, safe to widen later):
   * child tables may not themselves declare a TABLE field (no nested
     children yet) — validated, hard error if violated.
-  * named composite indexes are only ever added (CREATE INDEX IF NOT
-    EXISTS); one removed from a schema/patch file is left in place rather
-    than auto-dropped. Costs disk/write performance, never data — an
-    acceptable v1 gap, unlike column/table drops which go through the
-    diff+trash path.
-  * a widened/narrowed column type is always treated as destructive review,
-    not classified more finely (widening a VARCHAR is obviously safe;
-    stop-and-review-everything is the simpler, safer default for now).
+  * named indexes are created with a plain CREATE INDEX inside the migration
+    transaction (never CONCURRENTLY, which cannot run in one), so they block
+    writes to the table while they build.
+  * a table rename is not automated: a renamed schema file is a new table
+    plus a table that is no longer declared (reported, not dropped, unless
+    --allow-drops is given).
+
+What never happens just because something is not declared any more: a table,
+or the columns of a deleted patch file, are NOT dropped unless the operator
+passes allow_drops (`arc pgdb migrate --allow-drops`). Everything that is
+dropped, and every column type change, copies its values to _trash first.
 """
 
 from __future__ import annotations
@@ -48,7 +50,9 @@ import asyncio
 import contextlib
 import datetime as dt
 import heapq
+import json
 import logging
+import re
 import zlib
 from dataclasses import dataclass
 from dataclasses import field as dc_field
@@ -58,7 +62,7 @@ from typing import Any, Literal
 import arc
 
 from . import ddl, introspect
-from .fields import Field
+from .fields import Field, FieldError
 from .model import SchemaError, TableSchema, load_schemas_dir
 
 _logger = logging.getLogger("pgdb")
@@ -72,6 +76,10 @@ _logger = logging.getLogger("pgdb")
 # them.
 MIGRATE_LOCK_KEY = zlib.crc32(b"arc_psqldb_migrate")
 
+#: How long one DDL statement of a migration may wait for its table lock before
+#: the migration fails (and rolls back) instead of freezing the table's traffic.
+MIGRATION_LOCK_TIMEOUT = "30s"
+
 OpKind = Literal[
     "create_table",
     "drop_table",
@@ -84,6 +92,13 @@ OpKind = Literal[
     "add_unique",
     "drop_unique",
     "ensure_index",
+    "create_index",
+    "drop_index",
+    "drop_trigger",
+    "set_default",
+    "drop_default",
+    "add_foreign_key",
+    "drop_foreign_key",
     "add_unique_together",
     "drop_unique_together",
 ]
@@ -565,6 +580,316 @@ def _order_and_link(
 
 
 # ------------------------------------------------------------------------ #
+# Helpers for diffing one table
+# ------------------------------------------------------------------------ #
+def default_key(f: Field) -> str | None:
+    """A field's default as the single string _field_registry stores and the
+    next diff compares against (None = no default). Scalars keep the plain
+    str() form older registry rows already hold; a JSON dict/list is stored as
+    JSON text, so the same value always compares equal."""
+    if f.default is None:
+        return None
+    if isinstance(f.default, (dict, list)):
+        return json.dumps(f.default, sort_keys=True)
+    return str(f.default)
+
+
+def _prev_sql_type(prev: dict) -> str | None:
+    """The Postgres type a _field_registry row stands for, or None when it
+    cannot be told from the row alone (a REFERENCE to a non-id column, a
+    DECIMAL registered before precision/scale were kept)."""
+    if prev["type"] == "REFERENCE":
+        return None if prev.get("ref_field") else "UUID"
+    try:
+        return Field(
+            id=prev["id"],
+            name=prev["name"],
+            type=prev["type"],
+            length=prev.get("length"),
+            precision=prev.get("precision"),
+            scale=prev.get("scale"),
+        ).sql_type()
+    except FieldError:
+        return None
+
+
+#: Type changes that succeed but throw information away (the value or its
+#: detail), so the plan calls them out. Every type change is snapshotted to
+#: _trash first; these are the ones where the snapshot is likely to matter.
+_LOSSY_TYPE_CHANGES = frozenset(
+    {
+        ("FLOAT", "INT"),
+        ("FLOAT", "BIGINT"),
+        ("FLOAT", "DECIMAL"),
+        ("DECIMAL", "INT"),
+        ("DECIMAL", "BIGINT"),
+        ("DATETIME", "DATE"),
+        ("DATETIME", "TIME"),
+        ("INT", "BOOLEAN"),
+        ("BIGINT", "INT"),
+        ("BIGINT", "BOOLEAN"),
+    }
+)
+
+#: Postgres type name (as in _prev_sql_type / Field.sql_type, before any "(") ->
+#: information_schema.columns.data_type, for the drift check.
+_LIVE_DATA_TYPES = {
+    "VARCHAR": "character varying",
+    "TEXT": "text",
+    "BOOLEAN": "boolean",
+    "INTEGER": "integer",
+    "BIGINT": "bigint",
+    "REAL": "real",
+    "DOUBLE PRECISION": "double precision",
+    "NUMERIC": "numeric",
+    "DATE": "date",
+    "TIME": "time without time zone",
+    "TIMESTAMPTZ": "timestamp with time zone",
+    "JSONB": "jsonb",
+    "UUID": "uuid",
+}
+
+
+def _drift_warnings(
+    schema: TableSchema, mine: dict[str, dict], all_rows: list[dict], live: dict[str, dict]
+) -> list[str]:
+    """Where the real table differs from what _field_registry says was applied
+    — someone changed the database by hand, or a migration was half-reverted.
+    Reported, never "fixed" silently: the diff still trusts the registry, so the
+    warning is how a human finds out. Checks this plugin's own registry rows
+    (a column that is gone, or of another type) and, for a schema, columns
+    that exist but that nobody declared."""
+    if not live:
+        return []
+    out: list[str] = []
+    for row in mine.values():
+        if row["type"] == "TABLE":
+            continue
+        column = live.get(row["name"])
+        if column is None:
+            out.append(
+                f"drift on '{schema.table}': column '{row['name']}' is in the registry but missing "
+                f"from the database (changed outside `arc pgdb migrate`)."
+            )
+            continue
+        expected = _prev_sql_type(row)
+        if expected is None:
+            continue
+        want = _LIVE_DATA_TYPES.get(expected.split("(")[0])
+        have = column["data_type"]
+        if want and want != have and not (row["type"] == "FLOAT" and have == "real"):
+            out.append(
+                f"drift on '{schema.table}': column '{row['name']}' is {have} in the database "
+                f"but the registry says {row['type']} ({expected})."
+            )
+    if not schema.is_patch:
+        # Another plugin's patched-in columns are in all_rows: theirs, not drift.
+        known = {s.name for s in schema.system_fields} | {r["name"] for r in all_rows}
+        for name in sorted(set(live) - known):
+            out.append(
+                f"drift on '{schema.table}': column '{name}' exists in the database but no "
+                f"schema or patch declares it."
+            )
+    return out
+
+
+async def _refuse_truncation(
+    conn: Any,
+    schema: TableSchema,
+    f: Field,
+    prev: dict,
+    resolved_sql_type: str,
+    prev_sql_type: str | None,
+    live: dict[str, dict],
+) -> None:
+    """A type change to VARCHAR(n) cuts every longer value to n characters,
+    silently (an explicit cast truncates). Refuse it at plan time when some
+    stored value is longer, before anything runs."""
+    new = re.fullmatch(r"VARCHAR\((\d+)\)", resolved_sql_type)
+    if new is None:
+        return
+    new_len = int(new.group(1))
+    old = re.fullmatch(r"VARCHAR\((\d+)\)", prev_sql_type or "")
+    if old is not None and int(old.group(1)) <= new_len:
+        return  # a widening: nothing can be longer than it already was
+    column = prev["name"]
+    if column not in live:
+        return
+    longest = await conn.fetchval(f'SELECT max(char_length("{column}"::text)) FROM "{schema.table}"')
+    if longest is not None and longest > new_len:
+        raise MigrationError(
+            f"{'patch' if schema.is_patch else 'schema'} '{schema.source_path.name}' "
+            f"(plugin '{schema.plugin}'): field '{f.name}' on '{schema.table}' would become "
+            f"{resolved_sql_type}, but a stored value is {longest} characters long — the change "
+            f"would cut it short. Shorten or fix those values first, or choose a length of at "
+            f"least {longest}."
+        )
+
+
+async def _refuse_orphans(
+    conn: Any, schema: TableSchema, f: Field, column: str, ref: "ddl.RefColumn"
+) -> None:
+    """Making an existing column a REFERENCE adds a foreign key: every value must
+    match a row of the target. Checked at plan time when the target already
+    exists; a target created in this same plan can't have rows to miss."""
+    if not await introspect.table_exists(conn, ref.table):
+        return
+    orphans = await conn.fetchval(
+        f'SELECT count(*) FROM "{schema.table}" t WHERE t."{column}" IS NOT NULL AND NOT EXISTS '
+        f'(SELECT 1 FROM "{ref.table}" r WHERE r."{ref.column}"::text = t."{column}"::text)'
+    )
+    if orphans:
+        raise MigrationError(
+            f"{'patch' if schema.is_patch else 'schema'} '{schema.source_path.name}' "
+            f"(plugin '{schema.plugin}'): field '{f.name}' on '{schema.table}' cannot become a "
+            f"REFERENCE to '{ref.table}' — {orphans} stored value(s) match no row in "
+            f"{ref.table}.{ref.column}. Fix or clear those values first."
+        )
+
+
+def _column_snapshot_sql(table: str, column: str, *, old_name: str | None = None) -> str:
+    """INSERT ... SELECT that copies one column's values into _trash
+    (drop_type 'Column'), chunked COLUMN_DROP_CHUNK_SIZE rows per entry, as one
+    set-based statement. `old_name` is the column's name in the database right
+    now when a rename in the same plan has not run yet at snapshot time."""
+    col = old_name or column
+    return (
+        f'INSERT INTO _trash ("table", drop_type, snapshot, deleted_at) '
+        f"SELECT '{_q(table)}', 'Column', "
+        f"jsonb_agg(jsonb_build_object('_row_id', id, '{_q(col)}', \"{col}\") ORDER BY id), now() "
+        f'FROM (SELECT id, "{col}", (row_number() OVER (ORDER BY id) - 1) / {COLUMN_DROP_CHUNK_SIZE} AS chunk '
+        f'FROM "{table}") _chunked '
+        f"GROUP BY chunk"
+    )
+
+
+async def _diff_indexes(conn: Any, schema: TableSchema, *, new_table: bool) -> list[Op]:
+    """Named indexes, compared with the real database and with _index_registry:
+
+      * missing in the database      -> create it (a real, visible op);
+      * there, other columns/method  -> drop and create it again;
+      * there, on ANOTHER table      -> error: an index key is a database-wide
+                                        name, so the second table would silently
+                                        get no index;
+      * in the registry but no longer declared by this schema/patch -> drop it.
+
+    `new_table=True`: the table is being created in this plan and
+    create_table_sql() already creates its indexes, so only the key clash is
+    checked here."""
+    source: OpSource = "patch" if schema.is_patch else "schema"
+    declared = {idx["key"]: idx for idx in schema.indexes}
+    ops: list[Op] = []
+    for key, idx in declared.items():
+        live_idx = await introspect.live_index(conn, key)
+        if live_idx is not None and live_idx["table"] != schema.table:
+            raise MigrationError(
+                f"{source} '{schema.source_path.name}' (plugin '{schema.plugin}'): index key '{key}' "
+                f"is already used by table '{live_idx['table']}'. Index keys are database-wide "
+                f"names — give this one a name of its own (for example prefix it with "
+                f"'{schema.table}_')."
+            )
+        if new_table:
+            continue
+        want_columns = list(idx["fields"])
+        want_method = ddl.index_method(schema, idx)
+        create_sql = ddl.create_index_sql(schema, idx)
+        if live_idx is None:
+            ops.append(
+                Op(
+                    kind="create_index",
+                    table=schema.table,
+                    plugin=schema.plugin,
+                    source=source,
+                    description=f'{schema.table}: CREATE INDEX "{key}" ({", ".join(want_columns)})',
+                    sql=[create_sql],
+                )
+            )
+        elif live_idx["columns"] != want_columns or live_idx["method"] != want_method:
+            ops.append(
+                Op(
+                    kind="create_index",
+                    table=schema.table,
+                    plugin=schema.plugin,
+                    source=source,
+                    description=(
+                        f'{schema.table}: REBUILD INDEX "{key}" (now {", ".join(want_columns)}; '
+                        f"was {', '.join(str(c) for c in live_idx['columns'])})"
+                    ),
+                    sql=[f'DROP INDEX IF EXISTS "{key}"', create_sql],
+                )
+            )
+    if not new_table:
+        for row in await introspect.index_registry_rows(conn, schema.table):
+            if row["plugin"] == schema.plugin and row["key"] not in declared:
+                ops.append(
+                    Op(
+                        kind="drop_index",
+                        table=schema.table,
+                        plugin=schema.plugin,
+                        source=source,
+                        description=f'{schema.table}: DROP INDEX "{row["key"]}" (no longer declared)',
+                        sql=[f'DROP INDEX IF EXISTS "{row["key"]}"'],
+                    )
+                )
+    return ops
+
+
+def check_declaration_clashes(schemas: list[TableSchema], patches: list[TableSchema]) -> None:
+    """Two files that declare the same field id, the same column name or the
+    same index key on one table can't both be right. The diff only compares a
+    file with the REGISTRY, so on a first run (nothing registered yet) both are
+    "new", both columns are planned, and the registry then records only the
+    last one — locking the table's owner out on its next plan. Caught here,
+    across everything loaded, before any SQL runs."""
+    system_tables = {s.table for s in schemas if s.system}
+    ids: dict[tuple[str, str], tuple[TableSchema, Field]] = {}
+    names: dict[tuple[str, str], tuple[TableSchema, str, str]] = {}
+    index_keys: dict[str, TableSchema] = {}
+
+    def label(decl: TableSchema) -> str:
+        kind = "patch" if decl.is_patch else "schema"
+        return f"{kind} '{decl.source_path.name}' (plugin '{decl.plugin}')"
+
+    for decl in [*schemas, *patches]:
+        if decl.is_patch and decl.table in system_tables:
+            continue  # skipped later with a warning, never applied
+        for sf in decl.system_fields:
+            names[(decl.table, sf.name)] = (decl, sf.id, "a system column")
+        for f in decl.fields:
+            prior = ids.get((decl.table, f.id))
+            if prior is not None and prior[0] is not decl:
+                raise MigrationError(
+                    f"field id '{f.id}' on table '{decl.table}' is declared by {label(prior[0])} "
+                    f"('{prior[1].name}') and by {label(decl)} ('{f.name}'). A field id belongs to "
+                    f"one file: give one of them a different id."
+                )
+            ids[(decl.table, f.id)] = (decl, f)
+            if not f.is_column():
+                continue
+            seen = names.get((decl.table, f.name))
+            if seen is not None and seen[0] is not decl:
+                holder = (
+                    "a system column"
+                    if seen[2] == "a system column"
+                    else f"declared by {label(seen[0])} ('{seen[1]}')"
+                )
+                raise MigrationError(
+                    f"column '{f.name}' on table '{decl.table}' is declared by {label(decl)} "
+                    f"('{f.id}') but is already {holder}. Choose another name."
+                )
+            names[(decl.table, f.name)] = (decl, f.id, "declared")
+        for idx in decl.indexes:
+            other = index_keys.get(idx["key"])
+            if other is not None and other is not decl:
+                raise MigrationError(
+                    f"index key '{idx['key']}' is declared by {label(other)} (table '{other.table}') "
+                    f"and by {label(decl)} (table '{decl.table}'). Index keys are database-wide "
+                    f"names — give one of them a name of its own."
+                )
+            index_keys[idx["key"]] = decl
+
+
+# ------------------------------------------------------------------------ #
 # Diffing one table (schema OR patch — see module docstring)
 # ------------------------------------------------------------------------ #
 async def _diff_table(
@@ -604,6 +929,7 @@ async def _diff_table(
                 ],
                 True,
             )
+        await _diff_indexes(conn, schema, new_table=True)  # raises on a database-wide key clash
         stmts = ddl.create_table_sql(schema, parent_table=parent_table, ref_columns=ref_columns)
         return (
             [
@@ -648,6 +974,12 @@ async def _diff_table(
 
     ops: list[Op] = []
     current = {f.id: f for f in schema.fields}
+    # Column names the registry says are in use on this table right now, whoever
+    # owns them: what a new or renamed field must not collide with.
+    held_names = {row["name"]: row for row in all_rows}
+    live = await introspect.live_columns(conn, schema.table)
+    warnings = _drift_warnings(schema, mine, all_rows, live)
+    kind_name = "patch" if schema.is_patch else "schema"
 
     for fid, f in current.items():
         if not f.is_column():
@@ -656,12 +988,26 @@ async def _diff_table(
         if fid not in mine:
             other_owner = next((r["plugin"] for r in others if r["id"] == fid), None)
             if other_owner is not None:
-                kind = "patch" if schema.is_patch else "schema"
                 raise MigrationError(
-                    f"{kind} '{schema.source_path.name}' (plugin '{schema.plugin}') declares "
+                    f"{kind_name} '{schema.source_path.name}' (plugin '{schema.plugin}') declares "
                     f"field id '{fid}' ('{f.name}') on table '{schema.table}', but that id "
                     f"already belongs to plugin '{other_owner}' — a plugin may only add new "
                     f"field ids or modify field ids it already owns."
+                )
+            holder = held_names.get(f.name)
+            if holder is not None:
+                if holder["plugin"] == schema.plugin and holder["id"] not in current:
+                    raise MigrationError(
+                        f"{kind_name} '{schema.source_path.name}' (plugin '{schema.plugin}'): field "
+                        f"'{f.name}' has a new id '{fid}', but the column '{f.name}' already exists "
+                        f"under id '{holder['id']}'. The id is the field's identity: keep id "
+                        f"'{holder['id']}' to keep the column and its data, or give the new field a "
+                        f"different name to replace it (the old values go to _trash)."
+                    )
+                raise MigrationError(
+                    f"{kind_name} '{schema.source_path.name}' (plugin '{schema.plugin}'): cannot add "
+                    f"field '{f.name}' ('{fid}') to '{schema.table}' — a column with that name already "
+                    f"exists (field '{holder['id']}', plugin '{holder['plugin']}'). Choose another name."
                 )
             col_sql = f'ALTER TABLE "{schema.table}" ADD COLUMN {_column_def(f, schema.table, ref_columns)}'
             # A required column with no default is only safe to add on a
@@ -692,7 +1038,21 @@ async def _diff_table(
             continue
 
         prev = mine[fid]
+        if prev["type"] == "TABLE":
+            raise MigrationError(
+                f"{kind_name} '{schema.source_path.name}' (plugin '{schema.plugin}'): field "
+                f"'{f.name}' ('{fid}') was a TABLE field (a child table, no column) and is now "
+                f"{f.type}. That isn't automated — give the new column a new field id."
+            )
         if prev["name"] != f.name:
+            clash = held_names.get(f.name)
+            if clash is not None and clash["id"] != fid:
+                raise MigrationError(
+                    f"{kind_name} '{schema.source_path.name}' (plugin '{schema.plugin}'): cannot rename "
+                    f"'{prev['name']}' to '{f.name}' on '{schema.table}' — the column '{f.name}' still "
+                    f"exists (field '{clash['id']}'). Renames that swap or chain names can't run in one "
+                    f"step: rename through a temporary name, in two migrations."
+                )
             ops.append(
                 Op(
                     kind="rename_column",
@@ -707,7 +1067,8 @@ async def _diff_table(
                 )
             )
 
-        if f.type == "REFERENCE":
+        was_reference = prev["type"] == "REFERENCE"
+        if f.type == "REFERENCE" and was_reference:
             # Changing what an EXISTING REFERENCE field points at isn't
             # automated — unlike a plain type/length change, this also means
             # the FK constraint itself has to be dropped and recreated
@@ -728,6 +1089,10 @@ async def _diff_table(
             # never fired either) — the live FK constraint kept pointing at
             # the original table forever while the schema file claimed
             # something else, with no error and no warning.
+            #
+            # A plain column BECOMING a REFERENCE is a different case, handled
+            # below: nothing exists yet to repoint, so the foreign key is just
+            # added.
             new_target_table = ref_columns[(schema.table, f.name)].table
             ref_field_changed = prev.get("ref_field") != f.target_field
             ref_table_changed = prev.get("ref_table") != new_target_table
@@ -747,33 +1112,102 @@ async def _diff_table(
         resolved_sql_type = (
             ref_columns[(schema.table, f.name)].sql_type if f.type == "REFERENCE" else f.sql_type()
         )
-        type_changed = prev["type"] != f.type
-        length_changed = prev.get("length") != f.length and f.type in (
-            "STRING",
-            "SELECT",
-            "EMAIL",
-            "PHONE",
+        # Compared as the real Postgres type each side maps to, not as the
+        # declared names: STRING -> EMAIL (both VARCHAR) is not a change,
+        # `length: 255` on a STRING that had no length (already VARCHAR(255)) is
+        # not a change, and DECIMAL's precision/scale are part of the type.
+        # Two REFERENCE fields never differ here (the guard above stopped a
+        # retarget).
+        prev_sql_type = _prev_sql_type(prev)
+        physical_changed = not (was_reference and f.type == "REFERENCE") and (
+            prev_sql_type != resolved_sql_type
         )
-        # DECIMAL's own two dimensions — precision/scale — used to be
-        # invisible to this diff entirely: _field_registry had no columns to
-        # remember them in, so DECIMAL(10,2) -> DECIMAL(12,4) produced zero
-        # ops, silently leaving the live column on its original shape
-        # forever. `scale` defaults to 0 in both the schema (Field.sql_type)
-        # and here, so an unset scale on either side compares equal to an
-        # explicit 0 rather than a spurious mismatch.
-        decimal_changed = f.type == "DECIMAL" and (
-            prev.get("precision") != f.precision or (prev.get("scale") or 0) != (f.scale or 0)
-        )
-        if type_changed or length_changed or decimal_changed:
+
+        if was_reference and f.type != "REFERENCE":
+            # REFERENCE -> a plain column: the foreign key has to go too, or the
+            # column would keep rejecting values the schema no longer constrains.
+            fk_names = await introspect.single_column_constraints(
+                conn, schema.table, [prev["name"], f.name], "f"
+            )
+            ops.append(
+                Op(
+                    kind="drop_foreign_key",
+                    table=schema.table,
+                    plugin=schema.plugin,
+                    source=source,
+                    description=f'{schema.table}: DROP FOREIGN KEY on "{f.name}" (no longer a REFERENCE)',
+                    sql=[
+                        f'ALTER TABLE "{schema.table}" DROP CONSTRAINT IF EXISTS "{name}"'
+                        for name in (fk_names or [f"{schema.table}_{prev['name']}_fkey"])
+                    ],
+                    destructive=False,
+                )
+            )
+
+        if physical_changed:
+            await _refuse_truncation(conn, schema, f, prev, resolved_sql_type, prev_sql_type, live)
+            lossy = (prev["type"], f.type) in _LOSSY_TYPE_CHANGES
             ops.append(
                 Op(
                     kind="alter_type",
                     table=schema.table,
                     plugin=schema.plugin,
                     source=source,
-                    description=f'{schema.table}: ALTER COLUMN "{f.name}" TYPE {resolved_sql_type} (was {prev["type"]}) — REVIEW: may fail or truncate data',
+                    description=(
+                        f'{schema.table}: ALTER COLUMN "{f.name}" TYPE {resolved_sql_type} '
+                        f"(was {prev['type']}) — REVIEW: "
+                        + (
+                            "LOSSY (precision, time of day or value detail is lost); "
+                            if lossy
+                            else "fails if a value cannot be converted; "
+                        )
+                        + "the old values are saved to _trash first"
+                    ),
                     sql=[
-                        f'ALTER TABLE "{schema.table}" ALTER COLUMN "{f.name}" TYPE {resolved_sql_type} USING "{f.name}"::{resolved_sql_type}'
+                        # The column is copied to _trash BEFORE it is rewritten, the
+                        # same safety net a dropped column gets, so a conversion
+                        # that loses information can still be undone.
+                        _column_snapshot_sql(schema.table, f.name, old_name=prev["name"]),
+                        f'ALTER TABLE "{schema.table}" ALTER COLUMN "{f.name}" TYPE {resolved_sql_type} USING "{f.name}"::{resolved_sql_type}',
+                    ],
+                    destructive=True,
+                )
+            )
+        elif f.type == "FLOAT" and live.get(prev["name"], {}).get("data_type") == "real":
+            # FLOAT used to be a 4-byte REAL (about 7 digits); it is now DOUBLE
+            # PRECISION. A column created before that still is REAL: widening it
+            # loses nothing, so it is done once, without a snapshot.
+            ops.append(
+                Op(
+                    kind="alter_type",
+                    table=schema.table,
+                    plugin=schema.plugin,
+                    source=source,
+                    description=f'{schema.table}: ALTER COLUMN "{f.name}" TYPE DOUBLE PRECISION (was REAL — widening, lossless)',
+                    sql=[
+                        f'ALTER TABLE "{schema.table}" ALTER COLUMN "{f.name}" TYPE DOUBLE PRECISION'
+                    ],
+                    destructive=False,
+                )
+            )
+
+        if f.type == "REFERENCE" and not was_reference:
+            ref = ref_columns[(schema.table, f.name)]
+            await _refuse_orphans(conn, schema, f, prev["name"], ref)
+            ops.append(
+                Op(
+                    kind="add_foreign_key",
+                    table=schema.table,
+                    plugin=schema.plugin,
+                    source=source,
+                    description=(
+                        f'{schema.table}: ADD FOREIGN KEY "{f.name}" -> {ref.table}({ref.column}) '
+                        f"— REVIEW: fails if a value matches no row there"
+                    ),
+                    sql=[
+                        f'ALTER TABLE "{schema.table}" ADD CONSTRAINT "{schema.table}_{f.name}_fkey" '
+                        f'FOREIGN KEY ("{f.name}") REFERENCES "{ref.table}"("{ref.column}") '
+                        f"ON DELETE RESTRICT"
                     ],
                     destructive=True,
                 )
@@ -822,24 +1256,18 @@ async def _diff_table(
                     )
                 )
             else:
-                # The live constraint was created under whatever name the
-                # column had AT THAT TIME ("{table}_{column}_key", the same
-                # pattern the add_unique branch above names it with) — a
-                # RENAME COLUMN (above, in this SAME diff pass) renames only
-                # the column, never the constraint object itself. Using
-                # prev["name"] here rather than f.name is what makes a
-                # same-pass rename-then-drop-unique actually target the
-                # real, live constraint instead of a name that was never
-                # created (a silently no-op'd `IF EXISTS`, leaving the
-                # original constraint behind forever, still enforcing
-                # uniqueness the schema no longer declares — confirmed live
-                # against a real Postgres database before this fix).
-                # Narrower residual case, not handled here: a field renamed
-                # in an EARLIER, separate migrate run (while still unique)
-                # never had its constraint renamed either, so a unique-drop
-                # in a LATER run still won't find it under prev["name"] —
-                # only a same-pass rename+drop is covered.
-                constraint = f"{schema.table}_{prev['name']}_key"
+                # The constraint keeps the name it was CREATED under
+                # ("{table}_{column}_key" for the column's name back then): a
+                # RENAME COLUMN renames the column only, never the constraint,
+                # in this pass or in an earlier migrate. Guessing the name from
+                # the current (or even the previous) column name therefore
+                # missed it, silently leaving uniqueness in force while the
+                # registry said "not unique". It is found by COLUMN instead —
+                # the column is called prev["name"] now (a rename in this same
+                # plan has not run yet) or f.name (renamed by an earlier run).
+                found = await introspect.single_column_constraints(
+                    conn, schema.table, [prev["name"], f.name], "u"
+                )
                 ops.append(
                     Op(
                         kind="drop_unique",
@@ -848,7 +1276,41 @@ async def _diff_table(
                         source=source,
                         description=f'{schema.table}: DROP UNIQUE ("{f.name}")',
                         sql=[
-                            f'ALTER TABLE "{schema.table}" DROP CONSTRAINT IF EXISTS "{constraint}"'
+                            f'ALTER TABLE "{schema.table}" DROP CONSTRAINT IF EXISTS "{name}"'
+                            for name in (found or [f"{schema.table}_{prev['name']}_key"])
+                        ],
+                        destructive=False,
+                    )
+                )
+
+        new_default = default_key(f)
+        if not f.primary_key and new_default != prev.get("default"):
+            if f.default is None:
+                ops.append(
+                    Op(
+                        kind="drop_default",
+                        table=schema.table,
+                        plugin=schema.plugin,
+                        source=source,
+                        description=f'{schema.table}: DROP DEFAULT on "{f.name}" (existing rows keep their values)',
+                        sql=[f'ALTER TABLE "{schema.table}" ALTER COLUMN "{f.name}" DROP DEFAULT'],
+                        destructive=False,
+                    )
+                )
+            else:
+                ops.append(
+                    Op(
+                        kind="set_default",
+                        table=schema.table,
+                        plugin=schema.plugin,
+                        source=source,
+                        description=(
+                            f'{schema.table}: SET DEFAULT on "{f.name}" to {ddl.default_sql(f)} '
+                            f"(new rows only; existing rows keep their values)"
+                        ),
+                        sql=[
+                            f'ALTER TABLE "{schema.table}" ALTER COLUMN "{f.name}" '
+                            f"SET DEFAULT {ddl.default_sql(f)}"
                         ],
                         destructive=False,
                     )
@@ -857,6 +1319,8 @@ async def _diff_table(
     for fid, prev in mine.items():
         if fid in current:
             continue
+        if prev["type"] == "TABLE":
+            continue  # a child-table field never had a column here, so there is nothing to drop
         # A field is only "missing, therefore dropped" if the file being
         # diffed right now is the same KIND of file that declared it in the
         # first place (found by testing this against a real DB: adding a
@@ -873,22 +1337,10 @@ async def _diff_table(
         expected_source = "patch" if schema.is_patch else "schema"
         if prev.get("source", "schema") != expected_source:
             continue
-        ops.append(_drop_column_op(schema, prev, source=source))
+        ops.append(_drop_column_op(schema.table, schema.plugin, prev, source=source))
 
-    ops += [
-        Op(
-            kind="ensure_index",
-            table=schema.table,
-            plugin=schema.plugin,
-            source=source,
-            description=f'{schema.table}: ensure index "{idx["key"]}"',
-            sql=[stmt],
-            destructive=False,
-            maintenance=True,
-        )
-        for idx, stmt in zip(schema.indexes, ddl.index_sql(schema))
-    ]
-    return ops, [], False
+    ops += await _diff_indexes(conn, schema, new_table=False)
+    return ops, warnings, False
 
 
 async def _diff_unique_together(
@@ -998,7 +1450,9 @@ def _column_def(
 COLUMN_DROP_CHUNK_SIZE = 10_000
 
 
-def _drop_column_op(schema: TableSchema, prev: dict, *, source: OpSource) -> Op:
+def _drop_column_op(
+    table: str, plugin: str, prev: dict, *, source: OpSource, forget_registry: bool = False
+) -> Op:
     """Every existing row's value for this column is snapshotted into
     _trash BEFORE the column is actually dropped — chunked into groups of
     COLUMN_DROP_CHUNK_SIZE rows per _trash entry (one jsonb ARRAY of
@@ -1023,25 +1477,25 @@ def _drop_column_op(schema: TableSchema, prev: dict, *, source: OpSource) -> Op:
     Reached both when a schema removes a field it owns and when a patch
     removes a field it previously added — identical treatment either way."""
     col = prev["name"]
-    snapshot_sql = (
-        f'INSERT INTO _trash ("table", drop_type, snapshot, deleted_at) '
-        f"SELECT '{_q(schema.table)}', 'Column', "
-        f"jsonb_agg(jsonb_build_object('_row_id', id, '{_q(col)}', \"{col}\") ORDER BY id), now() "
-        f'FROM (SELECT id, "{col}", (row_number() OVER (ORDER BY id) - 1) / {COLUMN_DROP_CHUNK_SIZE} AS chunk '
-        f'FROM "{schema.table}") _chunked '
-        f"GROUP BY chunk"
-    )
-    drop_sql = f'ALTER TABLE "{schema.table}" DROP COLUMN "{col}"'
+    snapshot_sql = _column_snapshot_sql(table, col)
+    drop_sql = f'ALTER TABLE "{table}" DROP COLUMN "{col}"'
+    sql = [snapshot_sql, drop_sql]
+    if forget_registry:
+        # No schema/patch is declared for these registry rows any more, so the
+        # normal "rewrite this plugin's rows" step never reaches them.
+        sql.append(
+            f"DELETE FROM _field_registry WHERE \"table\" = '{_q(table)}' AND id = '{_q(prev['id'])}'"
+        )
     return Op(
         kind="drop_column",
-        table=schema.table,
-        plugin=schema.plugin,
+        table=table,
+        plugin=plugin,
         source=source,
         description=(
-            f'{schema.table}: DROP COLUMN "{col}" — every existing value snapshotted to _trash first '
+            f'{table}: DROP COLUMN "{col}" — every existing value snapshotted to _trash first '
             f"(chunked, {COLUMN_DROP_CHUNK_SIZE} rows/entry)"
         ),
-        sql=[snapshot_sql, drop_sql],
+        sql=sql,
         destructive=True,
     )
 
@@ -1055,7 +1509,15 @@ async def build_plan(
     patches: list[TableSchema] | None = None,
     *,
     only_table: str | None = None,
+    allow_drops: bool = False,
 ) -> MigrationPlan:
+    """Diff everything declared against the database. `allow_drops=False` (the
+    default) never plans the removal of anything that is merely no longer
+    DECLARED — a table, or a patch's column: "not declared" is also what a
+    disabled plugin, another git branch or a renamed file looks like, and
+    none of those means "delete the data". Such things come back as warnings;
+    `allow_drops=True` (`arc pgdb migrate --allow-drops`) plans the drops,
+    each with its rows copied to _trash first."""
     patches = patches or []
     bootstrapped = await introspect.bootstrap_applied(conn)
     plan = MigrationPlan()
@@ -1095,6 +1557,7 @@ async def build_plan(
 
     _resolve_child_owners(schemas)  # validates ownership; raises MigrationError on violation
     refuse_patches_on_own_tables(schemas, patches)  # a plugin never patches a table it owns
+    check_declaration_clashes(schemas, patches)  # one id/name/index key = one file
     system_tables = {s.table for s in schemas if s.system}
     ref_targets = resolve_ref_targets([*schemas, *patches])
     ref_columns = resolve_ref_columns(
@@ -1187,6 +1650,25 @@ async def build_plan(
                     maintenance=True,
                 )
             )
+        elif not skipped and table_exists_now:
+            # `audit` turned off: the trigger from when it was on would keep
+            # writing audit rows. Dropped here; the audit table and the history
+            # already in it stay.
+            trigger = f"arc_audit_{schema.plugin}"
+            if await introspect.trigger_exists(conn, schema.table, trigger):
+                plan.ops.append(
+                    Op(
+                        kind="drop_trigger",
+                        table=schema.table,
+                        plugin=schema.plugin,
+                        description=(
+                            f"{schema.table}: DROP audit trigger (audit is now off; "
+                            f"the audit history already recorded is kept)"
+                        ),
+                        sql=[f'DROP TRIGGER IF EXISTS {trigger} ON "{schema.table}"'],
+                        destructive=False,
+                    )
+                )
 
     for patch in patches:
         if only_table and patch not in targets:
@@ -1218,7 +1700,16 @@ async def build_plan(
             applied.append(patch)
 
     if not only_table:
-        plan.ops.extend(await _dropped_table_ops(conn, ordered))
+        drop_ops, drop_warnings = await _dropped_table_ops(
+            conn, ordered, allow_drops=allow_drops
+        )
+        plan.ops.extend(drop_ops)
+        plan.warnings.extend(drop_warnings)
+    orphan_ops, orphan_warnings = await _orphaned_patch_ops(
+        conn, ordered, patches, only_table=only_table, allow_drops=allow_drops
+    )
+    plan.ops.extend(orphan_ops)
+    plan.warnings.extend(orphan_warnings)
 
     # Only schemas/patches that were ACTUALLY diffed — a skipped patch (its
     # target table doesn't exist yet) must never reach registry_upsert_sql,
@@ -1235,6 +1726,15 @@ async def apply_plan(conn: Any, plan: MigrationPlan, *, reference: str) -> None:
     failure partway through never leaves bookkeeping out of sync with the
     actual tables."""
     async with conn.transaction():
+        # A migration is not an application query. The pool's statement timeout
+        # (30 s by default) and idle-in-transaction timeout would cancel a long
+        # CREATE INDEX, type rewrite or _trash snapshot on a big table and roll
+        # the whole migration back, so they are lifted for THIS transaction only
+        # (SET LOCAL). A DDL that cannot get its lock gives up instead: left
+        # waiting, it would also queue every query that arrives behind it.
+        await conn.execute("SET LOCAL statement_timeout = 0")
+        await conn.execute("SET LOCAL idle_in_transaction_session_timeout = 0")
+        await conn.execute(f"SET LOCAL lock_timeout = '{MIGRATION_LOCK_TIMEOUT}'")
         for op in plan.ops:
             for stmt in op.sql:
                 await conn.execute(stmt)
@@ -1242,20 +1742,82 @@ async def apply_plan(conn: Any, plan: MigrationPlan, *, reference: str) -> None:
             await conn.execute(stmt)
         for stmt in unique_together_upsert_sql(plan.schemas):
             await conn.execute(stmt)
+        for stmt in index_registry_upsert_sql(plan.schemas):
+            await conn.execute(stmt)
         for stmt in patch_history_sql(plan.ops, reference):
             await conn.execute(stmt)
 
 
-async def _dropped_table_ops(conn: Any, declared: list[TableSchema]) -> list[Op]:
+async def _orphaned_patch_ops(
+    conn: Any,
+    declared: list[TableSchema],
+    patches: list[TableSchema],
+    *,
+    only_table: str | None,
+    allow_drops: bool,
+) -> tuple[list[Op], list[str]]:
+    """Columns a patch added whose patch FILE is gone (deleted, or its plugin
+    disabled). Removing one FIELD from a patch that stays is a normal diff; a
+    missing patch is only "not declared", which is not the same as "remove".
+    With `allow_drops` each such column is dropped (values copied to _trash
+    first, registry row forgotten); otherwise it is reported and kept."""
+    declared_patch_keys = {(p.table, p.plugin) for p in patches}
+    declared_tables = {s.table for s in declared}
+    by_owner: dict[tuple[str, str], list[dict]] = {}
+    for row in await introspect.patch_registry_rows(conn):
+        key = (row["table"], row["plugin"])
+        if key in declared_patch_keys or row["table"] not in declared_tables:
+            continue  # still declared, or the whole table is handled as a table drop
+        if only_table and row["table"] != only_table:
+            continue
+        by_owner.setdefault(key, []).append(row)
+    ops: list[Op] = []
+    warnings: list[str] = []
+    for (table, plugin), rows in sorted(by_owner.items()):
+        columns = sorted(r["name"] for r in rows if r["type"] != "TABLE")
+        if not columns:
+            continue
+        if not allow_drops:
+            warnings.append(
+                f"no patch from plugin '{plugin}' is declared for table '{table}' any more, but "
+                f"it added the column(s) {columns}. Kept as they are (a missing patch file is "
+                f"also a disabled plugin). Run `arc pgdb migrate --allow-drops` to drop them; "
+                f"their values are saved to _trash first."
+            )
+            continue
+        ops.extend(
+            _drop_column_op(table, plugin, row, source="patch", forget_registry=True)
+            for row in rows
+            if row["type"] != "TABLE"
+        )
+    return ops, warnings
+
+
+async def _dropped_table_ops(
+    conn: Any, declared: list[TableSchema], *, allow_drops: bool = False
+) -> tuple[list[Op], list[str]]:
+    """Tables in the registry that no loaded schema declares. "Not declared"
+    also describes a disabled plugin, a plugin that failed to load, another git
+    branch and a renamed schema file — so without `allow_drops` nothing is
+    dropped and each table is reported once. With it, the table's rows are
+    copied to _trash and the table dropped."""
     declared_names = {s.table for s in declared}
-    rows = (
-        await conn.fetch('select distinct "table" from _field_registry')
-        if await introspect.bootstrap_applied(conn)
-        else []
-    )
-    ops = []
-    for row in rows:
-        table = row["table"]
+    if not await introspect.bootstrap_applied(conn):
+        return [], []
+    registry = await conn.fetch('select "table", id, plugin from _field_registry')
+    ids_by_table: dict[str, set[str]] = {}
+    owners_by_table: dict[str, set[str]] = {}
+    for row in registry:
+        ids_by_table.setdefault(row["table"], set()).add(row["id"])
+        owners_by_table.setdefault(row["table"], set()).add(row["plugin"])
+    new_tables = {
+        s.table: {f.id for f in s.fields}
+        for s in declared
+        if s.table not in ids_by_table and not s.is_patch
+    }
+    ops: list[Op] = []
+    warnings: list[str] = []
+    for table in sorted(ids_by_table):
         if table in declared_names:
             continue
         # A table can have more than one owning plugin (a schema plus
@@ -1263,10 +1825,23 @@ async def _dropped_table_ops(conn: Any, declared: list[TableSchema]) -> list[Op]
         # first owner. Cosmetic only: which plugin's generated .sql file
         # mentions it, not which plugin's data gets dropped (all of it does,
         # snapshotted to _trash first, regardless of owner).
-        owners = await conn.fetch(
-            'select distinct plugin from _field_registry where "table" = $1', table
+        plugin = sorted(owners_by_table[table])[0]
+        renamed_to = next((n for n, ids in new_tables.items() if ids == ids_by_table[table]), None)
+        hint = (
+            f" It has exactly the fields of the new table '{renamed_to}': this looks like a "
+            f"RENAMED schema file. A rename is not automated — dropping '{table}' would leave "
+            f"'{renamed_to}' empty."
+            if renamed_to
+            else ""
         )
-        plugin = sorted(r["plugin"] for r in owners)[0] if owners else "unknown"
+        if not allow_drops:
+            warnings.append(
+                f"table '{table}' (plugin '{plugin}') is in the database but no loaded schema "
+                f"declares it — NOT dropped. A disabled or failing plugin, another git branch "
+                f"or a renamed file all look like this.{hint} To drop it on purpose, run "
+                f"`arc pgdb migrate --allow-drops` (its rows are saved to _trash first)."
+            )
+            continue
         snapshot_sql = (
             f'INSERT INTO _trash ("table", drop_type, snapshot, deleted_at) '
             f"SELECT '{_q(table)}', 'Table', to_jsonb(t), now() FROM \"{table}\" t"
@@ -1276,7 +1851,7 @@ async def _dropped_table_ops(conn: Any, declared: list[TableSchema]) -> list[Op]
                 kind="drop_table",
                 table=table,
                 plugin=plugin,
-                description=f'DROP TABLE "{table}" — every row snapshotted to _trash first',
+                description=f'DROP TABLE "{table}" — every row snapshotted to _trash first' + hint,
                 sql=[
                     snapshot_sql,
                     # CASCADE, not a plain DROP: when more than one
@@ -1296,11 +1871,12 @@ async def _dropped_table_ops(conn: Any, declared: list[TableSchema]) -> list[Op]
                     f'DROP TABLE IF EXISTS "{table}" CASCADE',
                     f"DELETE FROM _field_registry WHERE \"table\" = '{_q(table)}'",
                     f"DELETE FROM _unique_together WHERE \"table\" = '{_q(table)}'",
+                    f"DELETE FROM _index_registry WHERE \"table\" = '{_q(table)}'",
                 ],
                 destructive=True,
             )
         )
-    return ops
+    return ops, warnings
 
 
 def registry_upsert_sql(schemas: list[TableSchema], ref_targets: dict[str, str]) -> list[str]:
@@ -1352,7 +1928,7 @@ def registry_upsert_sql(schemas: list[TableSchema], ref_targets: dict[str, str])
             # original precision/scale forever.
             precision = f.precision if f.type == "DECIMAL" and f.precision is not None else "NULL"
             scale = f.scale if f.type == "DECIMAL" and f.scale is not None else "NULL"
-            default = f"'{_q(f.default)}'" if f.default is not None else "NULL"
+            default = f"'{_q(default_key(f))}'" if f.default is not None else "NULL"
             ref_table = (
                 f"'{_q(ref_targets[f.target])}'" if f.type in ("REFERENCE", "TABLE") else "NULL"
             )
@@ -1421,6 +1997,33 @@ def unique_together_upsert_sql(schemas: list[TableSchema]) -> list[str]:
                 'INSERT INTO _unique_together ("table", "key", fields, plugin) '
                 f"VALUES ('{_q(schema.table)}', '{_q(ut['key'])}', {fields_sql}, '{_q(schema.plugin)}') "
                 'ON CONFLICT ("table", "key") DO UPDATE SET '
+                "fields = EXCLUDED.fields, plugin = EXCLUDED.plugin, updated_at = now()"
+            )
+    return stmts
+
+
+def index_registry_upsert_sql(schemas: list[TableSchema]) -> list[str]:
+    """After applying a plan, _index_registry is rewritten to the named indexes
+    each schema/patch declares — what the next diff compares against to notice a
+    removed index. Same (table, plugin)-scoped DELETE-then-INSERT shape as the
+    field and unique_together registries; an index key is database-wide, so the
+    INSERT also takes over a row that moved to another table."""
+    stmts = []
+    seen: set[tuple[str, str]] = set()
+    for schema in schemas:
+        key = (schema.table, schema.plugin)
+        if key not in seen:
+            seen.add(key)
+            stmts.append(
+                f"DELETE FROM _index_registry WHERE \"table\" = '{_q(schema.table)}' "
+                f"AND plugin = '{_q(schema.plugin)}'"
+            )
+        for idx in schema.indexes:
+            fields_sql = "ARRAY[" + ", ".join(f"'{_q(f)}'" for f in idx["fields"]) + "]"
+            stmts.append(
+                'INSERT INTO _index_registry ("key", "table", fields, plugin) '
+                f"VALUES ('{_q(idx['key'])}', '{_q(schema.table)}', {fields_sql}, '{_q(schema.plugin)}') "
+                'ON CONFLICT ("key") DO UPDATE SET "table" = EXCLUDED."table", '
                 "fields = EXCLUDED.fields, plugin = EXCLUDED.plugin, updated_at = now()"
             )
     return stmts

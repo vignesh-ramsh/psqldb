@@ -234,7 +234,9 @@ def _root_or_exit() -> Path:
     return root
 
 
-def _build_plan(plugin: str | None, table: str | None) -> migrate.MigrationPlan:
+def _build_plan(
+    plugin: str | None, table: str | None, *, allow_drops: bool = False
+) -> migrate.MigrationPlan:
     # The plugin-existence check needs boot()'s registered schemas/patches
     # but no live connection — done up front, sync, so a typo'd -p exits
     # before arc.runtime.run_async ever opens a pool for it.
@@ -249,7 +251,11 @@ def _build_plan(plugin: str | None, table: str | None) -> migrate.MigrationPlan:
             # plugins' tables look "no longer declared" to _dropped_table_ops),
             # then narrow both ops AND schemas to the scope — see _scope_plan.
             the_plan = await migrate.build_plan(
-                conn, arc.pgdb.schemas(), arc.pgdb.patches(), only_table=table
+                conn,
+                arc.pgdb.schemas(),
+                arc.pgdb.patches(),
+                only_table=table,
+                allow_drops=allow_drops,
             )
             if plugin:
                 _scope_plan(the_plan, plugin)
@@ -310,6 +316,12 @@ def _print_plan(plan: migrate.MigrationPlan) -> None:
     for warning in plan.warnings:
         console.print(f"[yellow]warning:[/yellow] {escape(warning)}")
 
+
+ALLOW_DROPS_HELP = (
+    "Also drop tables, and columns of deleted patch files, that no loaded schema/patch "
+    "declares any more (rows are copied to _trash first). Without it they are only reported: "
+    "a disabled plugin, another git branch or a renamed file looks exactly the same."
+)
 
 SCHEMA_DIR_NAME = "schema"  # under .arc/ — where the generated local JSON Schema files live
 
@@ -533,11 +545,12 @@ def plan(
         None, "-p", "--plugin", help="Only show changes for this plugin's schemas/patches."
     ),
     table: str = typer.Option(None, "-t", "--table", help="Only show changes for this table."),
+    allow_drops: bool = typer.Option(False, "--allow-drops", help=ALLOW_DROPS_HELP),
 ) -> None:
     """Preview what `arc pgdb migrate` would do — never touches the database."""
     _root_or_exit()
     with _friendly_errors():
-        the_plan = _build_plan(plugin, table)
+        the_plan = _build_plan(plugin, table, allow_drops=allow_drops)
         _print_plan(the_plan)
 
 
@@ -550,11 +563,16 @@ def migrate_(
     yes: bool = typer.Option(
         False, "--yes", "-y", help="Skip the confirmation prompt (for CI/non-interactive use)."
     ),
+    allow_drops: bool = typer.Option(False, "--allow-drops", help=ALLOW_DROPS_HELP),
 ) -> None:
     """Diff every registered schema AND patch against the live DB, show the
     plan, and — after confirmation — apply it. Always shows the plan first,
-    even with --yes; destructive changes (drops, type/NOT NULL tightening)
-    are always recoverable from _trash, but are still shown in red."""
+    even with --yes. Destructive changes are shown in red: a dropped column or
+    table, and a column type change, have their values copied to _trash first
+    (recoverable); NOT NULL and UNIQUE tightening copy nothing but fail, and
+    roll back, if existing rows break the rule. A table (or a deleted patch's
+    column) that is merely no longer declared is NOT dropped unless you pass
+    --allow-drops."""
     root = _root_or_exit()
 
     async def _do() -> bool:
@@ -580,7 +598,9 @@ def migrate_(
             # than failing outright; see migration_lock's own docstring for
             # why this is safe to hold across the interactive confirm below.
             async with migrate.migration_lock(conn):
-                the_plan = await migrate.build_plan(conn, schemas, patches, only_table=table)
+                the_plan = await migrate.build_plan(
+                    conn, schemas, patches, only_table=table, allow_drops=allow_drops
+                )
                 if plugin:
                     _scope_plan(the_plan, plugin)  # ops AND schemas — see _scope_plan
                 _print_plan(the_plan)

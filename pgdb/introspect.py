@@ -101,8 +101,83 @@ async def bootstrap_applied(conn: Any) -> bool:
         "_trash",
         "_patch_history",
         "_unique_together",
+        "_index_registry",
         "_routines_history",
     ):
         if not await table_exists(conn, table):
             return False
     return True
+
+
+async def index_registry_rows(conn: Any, table: str) -> list[dict]:
+    """Every _index_registry row for `table` — the named indexes pgdb created
+    as of the last successful migration. Empty before the registry exists."""
+    if not await table_exists(conn, "_index_registry"):
+        return []
+    rows = await conn.fetch('select * from _index_registry where "table" = $1', table)
+    return [dict(r) for r in rows]
+
+
+async def live_index(conn: Any, key: str) -> dict | None:
+    """The real index named `key` (index names are unique per schema, not per
+    table): {"table", "columns" (in order), "method"}, or None when there is
+    none. Expression columns come back as None entries."""
+    row = await conn.fetchrow(
+        "select t.relname as tbl, am.amname as method, "
+        "array(select a.attname::text from unnest(i.indkey::int2[]) with ordinality k(attnum, ord) "
+        "      left join pg_attribute a on a.attrelid = t.oid and a.attnum = k.attnum "
+        "      order by k.ord) as cols "
+        "from pg_class ic join pg_index i on i.indexrelid = ic.oid "
+        "join pg_class t on t.oid = i.indrelid "
+        "join pg_namespace n on n.oid = ic.relnamespace "
+        "join pg_am am on am.oid = ic.relam "
+        "where n.nspname = 'public' and ic.relname = $1",
+        key,
+    )
+    if row is None:
+        return None
+    return {"table": row["tbl"], "columns": list(row["cols"]), "method": row["method"]}
+
+
+async def trigger_exists(conn: Any, table: str, trigger: str) -> bool:
+    """Whether `table` carries a (non-internal) trigger called `trigger`."""
+    row = await conn.fetchval(
+        "select exists(select 1 from pg_trigger g join pg_class t on t.oid = g.tgrelid "
+        "join pg_namespace n on n.oid = t.relnamespace "
+        "where n.nspname = 'public' and t.relname = $1 and g.tgname = $2 and not g.tgisinternal)",
+        table,
+        trigger,
+    )
+    return bool(row)
+
+
+async def single_column_constraints(
+    conn: Any, table: str, columns: list[str], kind: str
+) -> list[str]:
+    """Names of the single-column constraints of `kind` ('u' unique, 'f'
+    foreign key) on any of `columns` of `table`. Found by COLUMN, not by the
+    name pgdb would generate: a constraint keeps the name it was created
+    under when its column is later renamed."""
+    rows = await conn.fetch(
+        "select c.conname from pg_constraint c "
+        "join pg_class t on t.oid = c.conrelid "
+        "join pg_namespace n on n.oid = t.relnamespace "
+        "where n.nspname = 'public' and t.relname = $1 and c.contype::text = $3 "
+        "and cardinality(c.conkey) = 1 "
+        "and (select a.attname::text from pg_attribute a "
+        "     where a.attrelid = t.oid and a.attnum = c.conkey[1]) = any($2::text[]) "
+        "order by c.conname",
+        table,
+        columns,
+        kind,
+    )
+    return [r["conname"] for r in rows]
+
+
+async def patch_registry_rows(conn: Any) -> list[dict]:
+    """Every _field_registry row that a patch (not a schema) declared, across
+    all tables. Empty before the registry exists."""
+    if not await table_exists(conn, "_field_registry"):
+        return []
+    rows = await conn.fetch("select * from _field_registry where source = 'patch'")
+    return [dict(r) for r in rows]

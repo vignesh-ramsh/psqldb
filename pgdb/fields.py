@@ -41,7 +41,11 @@ _SQL_TEMPLATES: dict[str, str] = {
     "TEXT": "TEXT",
     "BOOLEAN": "BOOLEAN",
     "INT": "INTEGER",
-    "FLOAT": "REAL",
+    # BIGINT: a 64-bit whole number, for counters and byte sizes that pass INT's
+    # 2,147,483,647 ceiling. FLOAT is a double (8 bytes, about 15 digits): the
+    # earlier 4-byte REAL kept only about 7, so 16777217 came back as 16777216.
+    "BIGINT": "BIGINT",
+    "FLOAT": "DOUBLE PRECISION",
     "DECIMAL": "NUMERIC({precision},{scale})",
     "DATE": "DATE",
     "TIME": "TIME",

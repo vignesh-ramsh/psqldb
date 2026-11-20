@@ -16,6 +16,7 @@ Three kinds of output:
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Literal
 
@@ -88,7 +89,7 @@ def _user_column_sql(
     if f.required:
         parts.append("NOT NULL")
     if f.default is not None:
-        parts.append(f"DEFAULT {_sql_literal(f.default)}")
+        parts.append(f"DEFAULT {default_sql(f)}")
     if ref is not None:
         parts.append(f'REFERENCES "{ref.table}"("{ref.column}") ON DELETE RESTRICT')
     sql = " ".join(parts)
@@ -102,7 +103,34 @@ def _sql_literal(value) -> str:
         return "TRUE" if value else "FALSE"
     if isinstance(value, (int, float)):
         return str(value)
+    if isinstance(value, (dict, list)):
+        # A JSON default is written as JSON text, never as Python's repr
+        # ({'a': 1}), which Postgres cannot read back as JSON.
+        value = json.dumps(value, sort_keys=True)
     return "'" + str(value).replace("'", "''") + "'"
+
+
+#: Words a DATETIME / DATE default may use to mean "the moment the row is
+#: created" rather than "the moment this migration ran". Written as a plain
+#: quoted literal, Postgres would evaluate 'now' ONCE, at DDL time, and store the
+#: result as a constant, so every later row got the migration's timestamp.
+_NOW_WORDS = frozenset({"now", "now()", "current_timestamp"})
+_TODAY_WORDS = frozenset({"today", "current_date"})
+
+
+def default_sql(f: Field) -> str:
+    """The SQL after `DEFAULT` for one field. A DATETIME/DATE default of
+    "now"/"now()"/"current_timestamp" (or "today"/"current_date") becomes a real
+    function call that Postgres runs for each new row; everything else is a
+    literal."""
+    value = f.default
+    if f.type in ("DATETIME", "DATE") and isinstance(value, str):
+        word = value.strip().lower()
+        if word in _NOW_WORDS:
+            return "CURRENT_DATE" if f.type == "DATE" else "now()"
+        if word in _TODAY_WORDS:
+            return "CURRENT_DATE" if f.type == "DATE" else "date_trunc('day', now())"
+    return _sql_literal(value)
 
 
 def create_table_sql(
@@ -142,6 +170,24 @@ def create_table_sql(
     if not schema.system:
         stmts += trigger_attach_sql(schema.table)
     return stmts
+
+
+def index_method(schema: TableSchema, idx: dict) -> str:
+    """The access method index_sql() picks for one declared index: "gin" for a
+    lone JSONB field, "btree" for everything else."""
+    if len(idx["fields"]) == 1:
+        field = schema.columns_by_name.get(idx["fields"][0])
+        if field is not None and field.sql_type() == "JSONB":
+            return "gin"
+    return "btree"
+
+
+def create_index_sql(schema: TableSchema, idx: dict) -> str:
+    """CREATE INDEX for one declared index (no IF NOT EXISTS: the planner has
+    already checked that it is missing, so a clash is a real error)."""
+    cols = ", ".join(f'"{c}"' for c in idx["fields"])
+    using = "USING GIN " if index_method(schema, idx) == "gin" else ""
+    return f'CREATE INDEX "{idx["key"]}" ON "{schema.table}" {using}({cols})'
 
 
 def index_sql(schema: TableSchema) -> list[str]:
@@ -233,17 +279,12 @@ def trigger_attach_sql(table: str) -> list[str]:
 # review op for each of them even though nothing really changed.
 #
 # The reverse also happens — a column can be REMOVED here without an
-# automatic DROP either. `_field_registry."index"` (a BOOLEAN, meant to
-# flag an indexed field) was dead from the start: registry_upsert_sql never
-# wrote it (its own INSERT column list never named it, so it stayed FALSE
-# forever) and nothing ever read it — named indexes are tracked only as the
-# literal `CREATE INDEX` statements themselves, deliberately never diffed
-# against a registry column (this module's own docstring: index removal is
-# a documented no-op, not a gap). Removed here as dead-code cleanup, not a
-# behavior change; an already-bootstrapped project keeps the orphaned
-# column until an operator runs `ALTER TABLE _field_registry DROP COLUMN
-# "index"` by hand — same one-time-manual-ALTER story as every other
-# _field_registry shape change above, just in the opposite direction.
+# automatic DROP either. `_field_registry."index"` (a BOOLEAN) was dead from
+# the start: nothing wrote or read it. Removed here as dead-code cleanup; an
+# already-bootstrapped project keeps the orphaned column until an operator
+# runs `ALTER TABLE _field_registry DROP COLUMN "index"` by hand. Named
+# indexes are tracked in their own table, _index_registry (below), not in a
+# _field_registry column.
 # ------------------------------------------------------------------------ #
 BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
     "CREATE EXTENSION IF NOT EXISTS pgcrypto",
@@ -333,6 +374,23 @@ BOOTSTRAP_STRUCTURAL_SQL: list[str] = [
         created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
         PRIMARY KEY ("table", "key")
+    )
+    """,
+    # -- _index_registry: "the named indexes as of the last successful
+    # migration" — what lets a later migrate notice that an index was REMOVED
+    # from a schema/patch file (and drop it) instead of leaving it in the
+    # database for ever. Index keys are database-wide names, so the key alone
+    # is the primary key. `fields` keeps the declared column list, in order.
+    # A whole new table like _unique_together: an already-bootstrapped project
+    # gets it on its next migrate (bootstrap_applied() checks it by name).
+    """
+    CREATE TABLE IF NOT EXISTS _index_registry (
+        "key"       TEXT PRIMARY KEY,
+        "table"     TEXT NOT NULL,
+        fields      TEXT[] NOT NULL,
+        plugin      TEXT NOT NULL,
+        created_at  TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
     )
     """,
 ]
