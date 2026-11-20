@@ -216,6 +216,30 @@ def _q(value: Any) -> str:
 
 
 # ------------------------------------------------------------------------ #
+# Ownership: who may change which table
+# ------------------------------------------------------------------------ #
+def refuse_patches_on_own_tables(schemas: list[TableSchema], patches: list[TableSchema]) -> None:
+    """A plugin changes the tables it OWNS in their schema files, never with a patch. A patch is how one plugin adds
+    fields to a table ANOTHER plugin owns; on a plugin's own table it only splits one table's shape over two files,
+    so that what a table looks like depends on which of them you read (and on the order they merge in). Raises
+    MigrationError naming the patch, the table and the schema file to move the fields into, before anything is
+    planned, so no SQL runs. Ownership is "this plugin has a schema file for the table"; a patch from any other
+    plugin is untouched by this."""
+    owned = {(s.plugin, s.table): s for s in schemas}
+    for patch in patches:
+        schema = owned.get((patch.plugin, patch.table))
+        if schema is None:
+            continue
+        raise MigrationError(
+            f"patch '{patch.source_path.name}' (plugin '{patch.plugin}') targets table '{patch.table}', which plugin "
+            f"'{patch.plugin}' owns itself (schemas/{schema.source_path.name}). A plugin changes its own tables in "
+            f"their schema file, never with a patch: move the patch's fields and indexes into "
+            f"schemas/{schema.source_path.name} (keep the same field ids, so nothing is altered in the database) and "
+            f"delete the patch. Patches are for adding fields to another plugin's table."
+        )
+
+
+# ------------------------------------------------------------------------ #
 # Ordering + relational resolution — schemas only; patches never create a
 # table or own a child, so they never participate in this.
 # ------------------------------------------------------------------------ #
@@ -1070,6 +1094,7 @@ async def build_plan(
         )
 
     _resolve_child_owners(schemas)  # validates ownership; raises MigrationError on violation
+    refuse_patches_on_own_tables(schemas, patches)  # a plugin never patches a table it owns
     system_tables = {s.table for s in schemas if s.system}
     ref_targets = resolve_ref_targets([*schemas, *patches])
     ref_columns = resolve_ref_columns(
